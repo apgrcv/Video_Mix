@@ -10,8 +10,12 @@ build/
 *.egg
 
 # FFmpeg binaries (用户需要自己下载)
-bin/ffmpeg
-bin/ffprobe
+bin/
+# 但保留bin目录本身（如果需要）
+# bin/ffmpeg
+# bin/ffprobe
+# bin/ffmpeg.exe
+# bin/ffprobe.exe
 
 # Logs
 *.log
