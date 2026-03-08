@@ -1,4 +1,5 @@
 import json
+import itertools
 import math
 import os
 import queue
@@ -11,7 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tkinter as tk
-from tkinter import Tk, StringVar, BooleanVar, IntVar, filedialog, messagebox
+from tkinter import Tk, StringVar, BooleanVar, IntVar, filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 
@@ -163,34 +164,31 @@ def probe_stream_signature(ffprobe, video_path):
         )
     return v_sig, a_sig
 
-
 def is_copy_compatible(ffprobe, front, back):
-    front_sig = probe_stream_signature(ffprobe, front)
-    back_sig = probe_stream_signature(ffprobe, back)
-    if not front_sig or not back_sig:
-        return False
-    return front_sig == back_sig
+    return is_copy_compatible_many(ffprobe, [front, back])
 
 
 def is_copy_compatible_for_three(ffprobe, first, middle, last):
-    """检查三个视频是否可以无损拼接（编码格式、分辨率、帧率等完全一致）"""
-    first_sig = probe_stream_signature(ffprobe, first)
-    middle_sig = probe_stream_signature(ffprobe, middle)
-    last_sig = probe_stream_signature(ffprobe, last)
-    if not first_sig or not middle_sig or not last_sig:
+    return is_copy_compatible_many(ffprobe, [first, middle, last])
+
+
+def is_copy_compatible_many(ffprobe, video_paths):
+    signatures = [probe_stream_signature(ffprobe, video_path) for video_path in video_paths]
+    if not signatures or any(not signature for signature in signatures):
         return False
-    return first_sig == middle_sig == last_sig
+    first_signature = signatures[0]
+    return all(signature == first_signature for signature in signatures[1:])
 
 
 def build_scale_filter(width, height):
     return f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
 
 
-def concat_copy(ffmpeg, front, back, output, stop_event=None, on_proc=None):
+def concat_copy_many(ffmpeg, video_paths, output, stop_event=None, on_proc=None):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
     try:
-        tmp.write(f"file '{str(front)}'\n")
-        tmp.write(f"file '{str(back)}'\n")
+        for video_path in video_paths:
+            tmp.write(f"file '{str(video_path)}'\n")
         tmp.close()
         cmd = [
             ffmpeg,
@@ -240,369 +238,49 @@ def concat_copy(ffmpeg, front, back, output, stop_event=None, on_proc=None):
             return False, out_text
         except Exception as e:
             return False, str(e)
-        ts1 = tempfile.NamedTemporaryFile(delete=False, suffix=".ts")
-        ts2 = tempfile.NamedTemporaryFile(delete=False, suffix=".ts")
-        ts1.close()
-        ts2.close()
-        cmd1 = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(front),
-            "-c",
-            "copy",
-            "-bsf:v",
-            "h264_mp4toannexb",
-            "-f",
-            "mpegts",
-            ts1.name,
-        ]
-        cmd2 = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(back),
-            "-c",
-            "copy",
-            "-bsf:v",
-            "h264_mp4toannexb",
-            "-f",
-            "mpegts",
-            ts2.name,
-        ]
-        if stop_event and stop_event.is_set():
-            return False, "Cancelled"
-        code1, out1, err1 = run_command(cmd1)
-        if stop_event and stop_event.is_set():
-            return False, "Cancelled"
-        code2, out2, err2 = run_command(cmd2)
-        if code1 == 0 and code2 == 0:
-            cmd3 = [
-                ffmpeg,
-                "-y",
-                "-i",
-                f"concat:{ts1.name}|{ts2.name}",
-                "-c",
-                "copy",
-                "-bsf:a",
-                "aac_adtstoasc",
-                "-movflags",
-                "+faststart",
-                str(output),
-            ]
-            if stop_event and stop_event.is_set():
-                return False, "Cancelled"
-            code3, out3, err3 = run_command(cmd3)
-            os.unlink(ts1.name)
-            os.unlink(ts2.name)
-            if code3 == 0:
-                return True, out1 + err1 + out2 + err2 + out3 + err3
-            return False, out1 + err1 + out2 + err2 + out3 + err3
-        else:
-            try:
-                os.unlink(ts1.name)
-            except OSError:
-                pass
-            try:
-                os.unlink(ts2.name)
-            except OSError:
-                pass
-            return False, out1 + err1 + out2 + err2
     finally:
         try:
             os.unlink(tmp.name)
         except OSError:
             pass
+
+
+def concat_copy(ffmpeg, front, back, output, stop_event=None, on_proc=None):
+    return concat_copy_many(ffmpeg, [front, back], output, stop_event=stop_event, on_proc=on_proc)
 
 
 def concat_copy_three(ffmpeg, first, middle, last, output, stop_event=None, on_proc=None):
-    """三段视频无损拼接（copy stream）"""
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
-    try:
-        tmp.write(f"file '{str(first)}'\n")
-        tmp.write(f"file '{str(middle)}'\n")
-        tmp.write(f"file '{str(last)}'\n")
-        tmp.close()
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-fflags",
-            "+genpts",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            tmp.name,
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-        try:
-            startupinfo = None
-            if sys.platform == "win32":
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = subprocess.SW_HIDE
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8", errors="replace", startupinfo=startupinfo)
-            if on_proc:
-                on_proc(proc)
-            out_lines = []
-            while True:
-                if stop_event and stop_event.is_set():
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                    return False, "Cancelled"
-                line = proc.stdout.readline()
-                if line:
-                    out_lines.append(line.strip())
-                    continue
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-            code = proc.wait()
-            out_text = "\n".join(out_lines)
-            if code == 0:
-                return True, out_text
-            return False, out_text
-        except Exception as e:
-            return False, str(e)
-        # Fallback: 使用 TS 容器转换 + concat 协议
-        ts1 = tempfile.NamedTemporaryFile(delete=False, suffix=".ts")
-        ts2 = tempfile.NamedTemporaryFile(delete=False, suffix=".ts")
-        ts3 = tempfile.NamedTemporaryFile(delete=False, suffix=".ts")
-        ts1.close()
-        ts2.close()
-        ts3.close()
-        cmd1 = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(first),
-            "-c",
-            "copy",
-            "-bsf:v",
-            "h264_mp4toannexb",
-            "-f",
-            "mpegts",
-            ts1.name,
-        ]
-        cmd2 = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(middle),
-            "-c",
-            "copy",
-            "-bsf:v",
-            "h264_mp4toannexb",
-            "-f",
-            "mpegts",
-            ts2.name,
-        ]
-        cmd3 = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(last),
-            "-c",
-            "copy",
-            "-bsf:v",
-            "h264_mp4toannexb",
-            "-f",
-            "mpegts",
-            ts3.name,
-        ]
-        if stop_event and stop_event.is_set():
-            return False, "Cancelled"
-        code1, out1, err1 = run_command(cmd1)
-        if stop_event and stop_event.is_set():
-            return False, "Cancelled"
-        code2, out2, err2 = run_command(cmd2)
-        if stop_event and stop_event.is_set():
-            return False, "Cancelled"
-        code3, out3, err3 = run_command(cmd3)
-        if code1 == 0 and code2 == 0 and code3 == 0:
-            cmd_concat = [
-                ffmpeg,
-                "-y",
-                "-i",
-                f"concat:{ts1.name}|{ts2.name}|{ts3.name}",
-                "-c",
-                "copy",
-                "-bsf:a",
-                "aac_adtstoasc",
-                "-movflags",
-                "+faststart",
-                str(output),
-            ]
-            if stop_event and stop_event.is_set():
-                return False, "Cancelled"
-            code_concat, out_concat, err_concat = run_command(cmd_concat)
-            os.unlink(ts1.name)
-            os.unlink(ts2.name)
-            os.unlink(ts3.name)
-            if code_concat == 0:
-                return True, out1 + err1 + out2 + err2 + out3 + err3 + out_concat + err_concat
-            return False, out1 + err1 + out2 + err2 + out3 + err3 + out_concat + err_concat
-        else:
-            for ts_file in [ts1.name, ts2.name, ts3.name]:
-                try:
-                    os.unlink(ts_file)
-                except OSError:
-                    pass
-            return False, out1 + err1 + out2 + err2 + out3 + err3
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+    return concat_copy_many(ffmpeg, [first, middle, last], output, stop_event=stop_event, on_proc=on_proc)
 
 
-def concat_reencode(ffmpeg, ffprobe, front, back, output, target_resolution, progress_total=None, on_progress=None, on_proc=None):
+def concat_copy_four(ffmpeg, first, second, third, fourth, output, stop_event=None, on_proc=None):
+    return concat_copy_many(ffmpeg, [first, second, third, fourth], output, stop_event=stop_event, on_proc=on_proc)
+
+
+def concat_reencode_many(ffmpeg, ffprobe, video_paths, output, target_resolution, progress_total=None, on_progress=None, on_proc=None):
     width, height = target_resolution
     video_filter = build_scale_filter(width, height)
-    front_has_audio = probe_has_audio(ffprobe, front)
-    back_has_audio = probe_has_audio(ffprobe, back)
+    has_audio_flags = [probe_has_audio(ffprobe, video_path) for video_path in video_paths]
+    all_have_audio = all(has_audio_flags)
     use_videotoolbox = sys.platform == "darwin"
     if use_videotoolbox:
-        # macOS 硬件加速，10Mbps 码率保证画质，速度极快
         v_params = ["-c:v", "h264_videotoolbox", "-b:v", "10000k", "-allow_sw", "1"]
     else:
-        # 标准 x264 优化：veryfast 提升速度，crf 23 平衡画质与体积
         v_params = ["-c:v", "libx264", "-crf", "23", "-preset", "veryfast"]
 
-    if front_has_audio and back_has_audio:
-        filter_complex = (
-            f"[0:v]{video_filter}[v0];"
-            f"[1:v]{video_filter}[v1];"
-            "[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a0];"
-            "[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a1];"
-            "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
-        )
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(front),
-            "-i",
-            str(back),
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[v]",
-            "-map",
-            "[a]",
-        ] + v_params + [
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-    else:
-        filter_complex = (
-            f"[0:v]{video_filter}[v0];"
-            f"[1:v]{video_filter}[v1];"
-            "[v0][v1]concat=n=2:v=1:a=0[v]"
-        )
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(front),
-            "-i",
-            str(back),
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[v]",
-        ] + v_params + [
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-    cmd = cmd + ["-progress", "pipe:1", "-nostats"]
-    try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8", errors="replace", startupinfo=startupinfo)
-        if on_proc:
-            on_proc(proc)
-    except Exception as e:
-        return False, str(e), front_has_audio and back_has_audio
-    out_lines = []
-    try:
-        while True:
-            line = proc.stdout.readline()
-            if line:
-                s = line.strip()
-                if s.startswith("out_time_ms="):
-                    try:
-                        ms = int(s.split("=", 1)[1])
-                        seconds = ms / 1000000.0
-                        if progress_total and on_progress:
-                            remaining = max(0.0, progress_total - seconds)
-                            on_progress(remaining)
-                    except Exception:
-                        pass
-                else:
-                    out_lines.append(s)
-                continue
-            if proc.poll() is not None:
-                break
-            time.sleep(0.05)
-        code = proc.wait()
-    except Exception as e:
-        out_lines.append(str(e))
-        code = proc.returncode
-    return code == 0, "\n".join(out_lines), front_has_audio and back_has_audio
-
-
-def concat_reencode_three(ffmpeg, ffprobe, first, middle, last, output, target_resolution, progress_total=None, on_progress=None, on_proc=None):
-    """三段视频重编码合并，支持统一分辨率"""
-    width, height = target_resolution
-    video_filter = build_scale_filter(width, height)
-    first_has_audio = probe_has_audio(ffprobe, first)
-    middle_has_audio = probe_has_audio(ffprobe, middle)
-    last_has_audio = probe_has_audio(ffprobe, last)
-    all_have_audio = first_has_audio and middle_has_audio and last_has_audio
-    use_videotoolbox = sys.platform == "darwin"
-    if use_videotoolbox:
-        # macOS 硬件加速，10Mbps 码率保证画质，速度极快
-        v_params = ["-c:v", "h264_videotoolbox", "-b:v", "10000k", "-allow_sw", "1"]
-    else:
-        # 标准 x264 优化：veryfast 提升速度，crf 23 平衡画质与体积
-        v_params = ["-c:v", "libx264", "-crf", "23", "-preset", "veryfast"]
+    video_parts = [f"[{index}:v]{video_filter}[v{index}]" for index, _ in enumerate(video_paths)]
+    cmd = [ffmpeg, "-y"]
+    for video_path in video_paths:
+        cmd.extend(["-i", str(video_path)])
 
     if all_have_audio:
-        filter_complex = (
-            f"[0:v]{video_filter}[v0];"
-            f"[1:v]{video_filter}[v1];"
-            f"[2:v]{video_filter}[v2];"
-            "[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a0];"
-            "[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a1];"
-            "[2:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a2];"
-            "[v0][a0][v1][a1][v2][a2]concat=n=3:v=1:a=1[v][a]"
-        )
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(first),
-            "-i",
-            str(middle),
-            "-i",
-            str(last),
+        audio_parts = [
+            f"[{index}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a{index}]"
+            for index, _ in enumerate(video_paths)
+        ]
+        concat_inputs = "".join(f"[v{index}][a{index}]" for index, _ in enumerate(video_paths))
+        filter_complex = ";".join(video_parts + audio_parts + [f"{concat_inputs}concat=n={len(video_paths)}:v=1:a=1[v][a]"])
+        cmd += [
             "-filter_complex",
             filter_complex,
             "-map",
@@ -619,21 +297,9 @@ def concat_reencode_three(ffmpeg, ffprobe, first, middle, last, output, target_r
             str(output),
         ]
     else:
-        filter_complex = (
-            f"[0:v]{video_filter}[v0];"
-            f"[1:v]{video_filter}[v1];"
-            f"[2:v]{video_filter}[v2];"
-            "[v0][v1][v2]concat=n=3:v=1:a=0[v]"
-        )
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(first),
-            "-i",
-            str(middle),
-            "-i",
-            str(last),
+        concat_inputs = "".join(f"[v{index}]" for index, _ in enumerate(video_paths))
+        filter_complex = ";".join(video_parts + [f"{concat_inputs}concat=n={len(video_paths)}:v=1:a=0[v]"])
+        cmd += [
             "-filter_complex",
             filter_complex,
             "-map",
@@ -683,6 +349,45 @@ def concat_reencode_three(ffmpeg, ffprobe, first, middle, last, output, target_r
     return code == 0, "\n".join(out_lines), all_have_audio
 
 
+def concat_reencode(ffmpeg, ffprobe, front, back, output, target_resolution, progress_total=None, on_progress=None, on_proc=None):
+    return concat_reencode_many(
+        ffmpeg,
+        ffprobe,
+        [front, back],
+        output,
+        target_resolution,
+        progress_total=progress_total,
+        on_progress=on_progress,
+        on_proc=on_proc,
+    )
+
+
+def concat_reencode_three(ffmpeg, ffprobe, first, middle, last, output, target_resolution, progress_total=None, on_progress=None, on_proc=None):
+    return concat_reencode_many(
+        ffmpeg,
+        ffprobe,
+        [first, middle, last],
+        output,
+        target_resolution,
+        progress_total=progress_total,
+        on_progress=on_progress,
+        on_proc=on_proc,
+    )
+
+
+def concat_reencode_four(ffmpeg, ffprobe, first, second, third, fourth, output, target_resolution, progress_total=None, on_progress=None, on_proc=None):
+    return concat_reencode_many(
+        ffmpeg,
+        ffprobe,
+        [first, second, third, fourth],
+        output,
+        target_resolution,
+        progress_total=progress_total,
+        on_progress=on_progress,
+        on_proc=on_proc,
+    )
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -692,11 +397,13 @@ class App:
         self.total_tasks = 0
         self.completed_tasks = 0
 
-        self.intro_dir = StringVar()
+        self.tab_mode = StringVar(value="structured")
         self.front_dir = StringVar()
         self.middle_dir = StringVar()
         self.back_dir = StringVar()
+        self.random_dir = StringVar()
         self.output_dir = StringVar()
+        self.random_pick_count = IntVar(value=2)
         self.mode = StringVar(value="优先无损（失败自动转兼容）")
         self.resolution_mode = StringVar(value="custom")
         self.custom_width = IntVar(value=1080)
@@ -707,7 +414,7 @@ class App:
         self.running_procs = set()
         self.running_outputs = set()
         self.last_eta_emit = {}
-        self.log_panels = []  # List of dicts: {frame, label, text}
+        self.log_panels = []
         self.thread_slots = None
 
         self.build_ui()
@@ -766,7 +473,7 @@ class App:
         header.grid(row=0, column=0, sticky="ew", pady=(0, 15))
         header.grid_columnconfigure(0, weight=1)
         title = tk.Label(header, text="视频混剪合并工具", font=font_title, bg=bg_color, fg=fg_color)
-        subtitle = tk.Label(header, text="开头 × 前半段 × 中段 × 后半段 组合合并，支持自动统一分辨率", font=font_small, bg=bg_color, fg="#666666")
+        subtitle = tk.Label(header, text="前半段 × 中段 × 后半段 拼接，支持随机排列组合", font=font_small, bg=bg_color, fg="#666666")
         title.grid(row=0, column=0, sticky="w")
         subtitle.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
@@ -774,28 +481,56 @@ class App:
         path_section.grid(row=1, column=0, sticky="ew", pady=(0, 15))
         path_section.grid_columnconfigure(0, weight=1)
         tk.Label(path_section, text="素材与输出", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=0, sticky="w", pady=(0, 8))
-        path_content = tk.Frame(path_section, bg=bg_color)
-        path_content.grid(row=1, column=0, sticky="ew")
-        path_content.grid_columnconfigure(0, weight=1)
-        intro_row = self.build_path_row(path_content, "开头目录 (可选)", self.intro_dir, self.pick_intro)
-        front_row = self.build_path_row(path_content, "前半段目录", self.front_dir, self.pick_front)
-        middle_row = self.build_path_row(path_content, "中段目录 (可选)", self.middle_dir, self.pick_middle)
-        back_row = self.build_path_row(path_content, "后半段目录", self.back_dir, self.pick_back)
-        out_row = self.build_path_row(path_content, "输出目录", self.output_dir, self.pick_output)
-        self.intro_count_var = StringVar(value="共 0 个视频")
+
+        self.path_tabs = ttk.Notebook(path_section)
+        self.path_tabs.grid(row=1, column=0, sticky="ew")
+        self.path_tabs.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+
+        structured_tab = tk.Frame(self.path_tabs, bg=bg_color, padx=10, pady=10)
+        structured_tab.grid_columnconfigure(0, weight=1)
+        self.path_tabs.add(structured_tab, text="前中后拼接")
+
+        random_tab = tk.Frame(self.path_tabs, bg=bg_color, padx=10, pady=10)
+        random_tab.grid_columnconfigure(0, weight=1)
+        self.path_tabs.add(random_tab, text="随机排列组合")
+
+        front_row = self.build_path_row(structured_tab, "前半段目录", self.front_dir, self.pick_front)
+        middle_row = self.build_path_row(structured_tab, "中段目录 (可选)", self.middle_dir, self.pick_middle)
+        back_row = self.build_path_row(structured_tab, "后半段目录", self.back_dir, self.pick_back)
         self.front_count_var = StringVar(value="共 0 个视频")
         self.middle_count_var = StringVar(value="共 0 个视频")
         self.back_count_var = StringVar(value="共 0 个视频")
-        self.estimated_var = StringVar(value="预计输出数量：0")
-        tk.Label(intro_row, textvariable=self.intro_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
         tk.Label(front_row, textvariable=self.front_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
         tk.Label(middle_row, textvariable=self.middle_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
         tk.Label(back_row, textvariable=self.back_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
+
+        random_dir_row = self.build_path_row(random_tab, "文件目录", self.random_dir, self.pick_random_dir)
+        self.random_dir_count_var = StringVar(value="共 0 个视频")
+        tk.Label(random_dir_row, textvariable=self.random_dir_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
+
+        random_pick_row = tk.Frame(random_tab, bg=bg_color)
+        random_pick_row.grid(row=1, column=0, sticky="ew", pady=4)
+        random_pick_row.grid_columnconfigure(1, weight=1)
+        tk.Label(random_pick_row, text="拼接数量", font=font_normal, bg=bg_color, fg=fg_color, width=12, anchor="w").grid(row=0, column=0, sticky="w")
+        pick_menu = tk.OptionMenu(random_pick_row, self.random_pick_count, 2, 3, 4)
+        pick_menu.config(width=8, font=font_normal, bg="white", fg=fg_color, highlightthickness=0)
+        pick_menu["menu"].config(bg="white", fg=fg_color, font=font_normal)
+        pick_menu.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.random_pick_info_var = StringVar(value="当前拼接数量：2 段")
+        tk.Label(random_pick_row, textvariable=self.random_pick_info_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
+
+        shared_path_content = tk.Frame(path_section, bg=bg_color)
+        shared_path_content.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        shared_path_content.grid_columnconfigure(0, weight=1)
+        out_row = self.build_path_row(shared_path_content, "输出目录", self.output_dir, self.pick_output)
+        self.estimated_var = StringVar(value="预计输出数量：0")
         tk.Label(out_row, textvariable=self.estimated_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
-        self.intro_dir.trace_add("write", lambda *args: self.update_counts())
+
         self.front_dir.trace_add("write", lambda *args: self.update_counts())
         self.middle_dir.trace_add("write", lambda *args: self.update_counts())
         self.back_dir.trace_add("write", lambda *args: self.update_counts())
+        self.random_dir.trace_add("write", lambda *args: self.update_counts())
+        self.random_pick_count.trace_add("write", lambda *args: self.update_counts())
         self.update_counts()
 
         options_section = tk.Frame(container, bg=bg_color)
@@ -825,7 +560,7 @@ class App:
         tk.Label(row2, text="统一分辨率", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="w").grid(row=0, column=0, sticky="w")
         tk.Radiobutton(
             row2,
-            text="自动（以前半段为准）",
+            text="自动（以前当前任务首段为准）",
             variable=self.resolution_mode,
             value="auto",
             command=self.refresh_resolution_state,
@@ -896,13 +631,12 @@ class App:
         log_section.grid_columnconfigure(0, weight=1)
         log_section.grid_rowconfigure(1, weight=1)
         tk.Label(log_section, text="运行日志", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=0, sticky="w", pady=(0, 8))
-        
+
         self.log_container = tk.Frame(log_section, bg=bg_color)
         self.log_container.grid(row=1, column=0, sticky="nsew")
         self.log_container.grid_columnconfigure(0, weight=1)
         self.log_container.grid_rowconfigure(0, weight=1)
-        
-        # Initial system log
+
         self.log_text = ScrolledText(self.log_container, height=10, font=("Menlo", 11), state="disabled", bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db")
         self.log_text.grid(row=0, column=0, sticky="nsew")
 
@@ -932,13 +666,18 @@ class App:
         elif event.num == 5:
             self.scroll_canvas.yview_scroll(1, "units")
 
+    def on_tab_changed(self, event=None):
+        current_index = self.path_tabs.index(self.path_tabs.select())
+        self.tab_mode.set("structured" if current_index == 0 else "random")
+        self.update_counts()
+
     def build_path_row(self, parent, label, var, command):
         row = parent.grid_size()[1]
         row_frame = tk.Frame(parent, bg=self.ui_bg)
         row_frame.grid(row=row, column=0, sticky="ew", pady=4)
         row_frame.grid_columnconfigure(1, weight=1, minsize=360)
 
-        tk.Label(row_frame, text=label, font=self.font_normal, bg=self.ui_bg, fg=self.ui_fg, width=10, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(row_frame, text=label, font=self.font_normal, bg=self.ui_bg, fg=self.ui_fg, width=12, anchor="w").grid(row=0, column=0, sticky="w")
         entry = tk.Entry(row_frame, textvariable=var, font=self.font_normal, bg="white", fg=self.ui_fg, highlightthickness=1, highlightbackground="#d1d5db")
         entry.grid(row=0, column=1, sticky="ew", padx=(10, 10))
         tk.Button(row_frame, text="选择", command=command, font=self.font_normal, highlightbackground=self.ui_bg).grid(row=0, column=2, sticky="e")
@@ -956,25 +695,25 @@ class App:
         entries = [w for w in widgets if w.winfo_class() in {"Entry", "TEntry"}]
         buttons = [w for w in widgets if w.winfo_class() in {"Button", "TButton"}]
 
-        def info(w):
+        def info(widget):
             try:
-                text = w.cget("text")
+                text = widget.cget("text")
             except Exception:
                 text = ""
-            return f"{w.winfo_class():7} mapped={int(w.winfo_ismapped())} geom={w.winfo_geometry():>12} manager={w.winfo_manager():>5} text={text!r}"
+            return f"{widget.winfo_class():7} mapped={int(widget.winfo_ismapped())} geom={widget.winfo_geometry():>12} manager={widget.winfo_manager():>5} text={text!r}"
 
         print("=== UI DUMP BEGIN ===", flush=True)
         print(f"Python {sys.version}")
         print(f"Tkinter {tk.TkVersion}")
         try:
             print(f"Tcl/Tk {self.root.tk.call('info', 'patchlevel')}")
-        except:
+        except Exception:
             pass
         print(f"total={len(widgets)} mapped={len(mapped)} labels={len(labels)} entries={len(entries)} buttons={len(buttons)}", flush=True)
-        for w in labels[:40]:
-            print(info(w), flush=True)
-        for w in entries[:20]:
-            print(info(w), flush=True)
+        for widget in labels[:40]:
+            print(info(widget), flush=True)
+        for widget in entries[:20]:
+            print(info(widget), flush=True)
         print("=== UI DUMP END ===", flush=True)
 
     def refresh_resolution_state(self):
@@ -991,12 +730,6 @@ class App:
             self.front_dir.set(path)
             self.update_counts()
 
-    def pick_intro(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.intro_dir.set(path)
-            self.update_counts()
-
     def pick_middle(self):
         path = filedialog.askdirectory()
         if path:
@@ -1007,6 +740,12 @@ class App:
         path = filedialog.askdirectory()
         if path:
             self.back_dir.set(path)
+            self.update_counts()
+
+    def pick_random_dir(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.random_dir.set(path)
             self.update_counts()
 
     def pick_output(self):
@@ -1044,24 +783,68 @@ class App:
     def update_progress(self):
         self.queue.put(("progress", self.completed_tasks, self.total_tasks))
 
+    def count_random_outputs(self, video_count, pick_count):
+        if video_count < pick_count:
+            return 0
+        return math.perm(video_count, pick_count)
+
+    def build_output_name(self, video_paths):
+        return "_".join(video_path.stem for video_path in video_paths) + "_merged.mp4"
+
     def start_merge(self):
         if self.worker and self.worker.is_alive():
             return
-        intro_dir = self.intro_dir.get()
-        front_dir = self.front_dir.get()
-        middle_dir = self.middle_dir.get()
-        back_dir = self.back_dir.get()
+
+        strategy = self.tab_mode.get()
         output_dir = self.output_dir.get()
-        if not front_dir or not back_dir or not output_dir:
-            messagebox.showerror("错误", "请先选择前半段、后半段和输出目录")
+        if not output_dir:
+            messagebox.showerror("错误", "请先选择输出目录")
             return
-        intros = list_videos(intro_dir) if intro_dir else []
-        fronts = list_videos(front_dir)
-        middles = list_videos(middle_dir) if middle_dir else []
-        backs = list_videos(back_dir)
-        if not fronts or not backs:
-            messagebox.showerror("错误", "未找到可用的视频文件")
-            return
+
+        config = {
+            "strategy": strategy,
+            "output_dir": Path(output_dir),
+            "mode": "auto" if self.mode.get() == "优先无损（失败自动转兼容）" else "compat",
+            "resolution_mode": self.resolution_mode.get(),
+            "custom_resolution": (self.custom_width.get(), self.custom_height.get()),
+            "skip_existing": self.skip_existing.get(),
+        }
+
+        if strategy == "structured":
+            front_dir = self.front_dir.get()
+            back_dir = self.back_dir.get()
+            middle_dir = self.middle_dir.get()
+            if not front_dir or not back_dir:
+                messagebox.showerror("错误", "请先选择前半段、后半段和输出目录")
+                return
+            fronts = list_videos(front_dir)
+            middles = list_videos(middle_dir) if middle_dir else []
+            backs = list_videos(back_dir)
+            if not fronts or not backs:
+                messagebox.showerror("错误", "未找到可用的视频文件")
+                return
+            config.update({
+                "fronts": fronts,
+                "middles": middles,
+                "backs": backs,
+            })
+            self.total_tasks = len(fronts) * len(backs) if not middles else len(fronts) * len(middles) * len(backs)
+        else:
+            random_dir = self.random_dir.get()
+            if not random_dir:
+                messagebox.showerror("错误", "请先选择文件目录")
+                return
+            random_videos = list_videos(random_dir)
+            pick_count = int(self.random_pick_count.get() or 2)
+            if len(random_videos) < pick_count:
+                messagebox.showerror("错误", f"文件目录中的视频数量不足，至少需要 {pick_count} 个视频")
+                return
+            config.update({
+                "random_videos": random_videos,
+                "pick_count": pick_count,
+            })
+            self.total_tasks = self.count_random_outputs(len(random_videos), pick_count)
+
         ffmpeg = find_binary("ffmpeg")
         ffprobe = find_binary("ffprobe")
         if not ffmpeg or not ffprobe:
@@ -1069,53 +852,48 @@ class App:
             return
 
         self.stop_event.clear()
-        # 中段为空时退化为两段拼接
-        self.total_tasks = len(fronts) * len(backs) if not middles else len(fronts) * len(middles) * len(backs)
         self.completed_tasks = 0
         self.progress_canvas.update_idletasks()
         self.progress_canvas.coords(self.progress_bar_rect, 0, 0, 0, 16)
         self.progress_label.configure(text=f"0 / {self.total_tasks}")
         self.eta_label.configure(text="剩余时间估算：--:--")
-        
-        # Setup UI for concurrency
+
         try:
             max_workers = int(self.max_workers.get() or 1)
             max_workers = max(1, max_workers)
-        except:
+        except Exception:
             max_workers = 1
-            
-        # Clear log container and rebuild grid
+
         for widget in self.log_container.winfo_children():
             widget.destroy()
         self.log_panels = []
-        
+
         cols = math.ceil(math.sqrt(max_workers))
         rows = math.ceil(max_workers / cols)
-        
-        for r in range(rows):
-            self.log_container.grid_rowconfigure(r, weight=1)
-        for c in range(cols):
-            self.log_container.grid_columnconfigure(c, weight=1)
-            
+
+        for row in range(rows):
+            self.log_container.grid_rowconfigure(row, weight=1)
+        for col in range(cols):
+            self.log_container.grid_columnconfigure(col, weight=1)
+
         panel_height = 180
-        for i in range(max_workers):
-            r = i // cols
-            c = i % cols
+        for index in range(max_workers):
+            row = index // cols
+            col = index % cols
             frame = tk.Frame(self.log_container, bg="white", highlightthickness=1, highlightbackground="#d1d5db", height=panel_height)
-            frame.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
+            frame.grid(row=row, column=col, sticky="nsew", padx=2, pady=2)
             frame.grid_propagate(False)
             frame.grid_columnconfigure(0, weight=1)
             frame.grid_rowconfigure(1, weight=1)
-            
-            label = tk.Label(frame, text=f"线程 #{i+1}: 等待任务...", font=("Helvetica", 9, "bold"), bg="#f0f0f0", anchor="w", padx=5)
+
+            label = tk.Label(frame, text=f"线程 #{index+1}: 等待任务...", font=("Helvetica", 9, "bold"), bg="#f0f0f0", anchor="w", padx=5)
             label.grid(row=0, column=0, sticky="ew")
-            
+
             text = ScrolledText(frame, height=7, font=("Menlo", 10), state="disabled", bg="white", fg="#333333", bd=0)
             text.grid(row=1, column=0, sticky="nsew")
-            
+
             self.log_panels.append({"frame": frame, "label": label, "text": text})
 
-        # Redirect general log to first panel
         if self.log_panels:
             self.log_text = self.log_panels[0]["text"]
 
@@ -1123,22 +901,11 @@ class App:
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
 
-        mode_value = self.mode.get()
-        mode_key = "auto" if mode_value == "优先无损（失败自动转兼容）" else "compat"
-        config = {
-            "intros": intros,
-            "fronts": fronts,
-            "middles": middles,
-            "backs": backs,
-            "output_dir": Path(output_dir),
-            "mode": mode_key,
-            "resolution_mode": self.resolution_mode.get(),
-            "custom_resolution": (self.custom_width.get(), self.custom_height.get()),
-            "skip_existing": self.skip_existing.get(),
+        config.update({
             "ffmpeg": ffmpeg,
             "ffprobe": ffprobe,
             "max_workers": max_workers,
-        }
+        })
         self.worker = threading.Thread(target=self.run_merge, args=(config,), daemon=True)
         self.worker.start()
 
@@ -1150,10 +917,7 @@ class App:
         self.stop_button.configure(state="disabled")
 
     def run_merge(self, config):
-        intros = config.get("intros", [])
-        fronts = config["fronts"]
-        middles = config.get("middles", [])
-        backs = config["backs"]
+        strategy = config["strategy"]
         output_dir = config["output_dir"]
         mode = config["mode"]
         resolution_mode = config["resolution_mode"]
@@ -1163,10 +927,6 @@ class App:
         ffprobe = config["ffprobe"]
         max_workers = config.get("max_workers", 1)
 
-        # 判断是否使用三段合并
-        use_middle = len(middles) > 0
-        use_intro = len(intros) > 0
-
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
@@ -1175,44 +935,61 @@ class App:
             self.finish()
             return
 
-        # Init slots
         self.thread_slots = queue.Queue()
-        for i in range(max_workers):
-            self.thread_slots.put(i)
+        for index in range(max_workers):
+            self.thread_slots.put(index)
 
         combinations = []
-        if use_middle:
-            for front in fronts:
-                for middle in middles:
+        if strategy == "structured":
+            fronts = config["fronts"]
+            middles = config.get("middles", [])
+            backs = config["backs"]
+            if middles:
+                for front in fronts:
+                    for middle in middles:
+                        for back in backs:
+                            video_paths = (front, middle, back)
+                            output_name = self.build_output_name(video_paths)
+                            output_path = output_dir / output_name
+                            if skip_existing and output_path.exists():
+                                self.log(f"跳过已存在：{output_name}")
+                                self.completed_tasks += 1
+                                self.update_progress()
+                            else:
+                                combinations.append((video_paths, output_name, output_path))
+            else:
+                for front in fronts:
                     for back in backs:
-                        output_name = f"{front.stem}_{middle.stem}_{back.stem}_merged.mp4"
+                        video_paths = (front, back)
+                        output_name = self.build_output_name(video_paths)
                         output_path = output_dir / output_name
                         if skip_existing and output_path.exists():
                             self.log(f"跳过已存在：{output_name}")
                             self.completed_tasks += 1
                             self.update_progress()
                         else:
-                            combinations.append((front, middle, back, output_name, output_path))
+                            combinations.append((video_paths, output_name, output_path))
         else:
-            for front in fronts:
-                for back in backs:
-                    output_name = f"{front.stem}_{back.stem}_merged.mp4"
-                    output_path = output_dir / output_name
-                    if skip_existing and output_path.exists():
-                        self.log(f"跳过已存在：{output_name}")
-                        self.completed_tasks += 1
-                        self.update_progress()
-                    else:
-                        combinations.append((front, None, back, output_name, output_path))
+            random_videos = config["random_videos"]
+            pick_count = config["pick_count"]
+            for video_paths in itertools.permutations(random_videos, pick_count):
+                output_name = self.build_output_name(video_paths)
+                output_path = output_dir / output_name
+                if skip_existing and output_path.exists():
+                    self.log(f"跳过已存在：{output_name}")
+                    self.completed_tasks += 1
+                    self.update_progress()
+                else:
+                    combinations.append((video_paths, output_name, output_path))
 
         if not combinations:
             self.finish()
             return
 
-        def merge_combination(first, middle, last, output_name, output_path, intro=None, intro_index=None):
+        def merge_combination(video_paths, output_name, output_path):
             if self.stop_event.is_set():
                 return False, "Cancelled"
-            
+
             slot_idx = self.thread_slots.get()
             try:
                 def safe_remove(path_obj):
@@ -1224,103 +1001,51 @@ class App:
                     except Exception:
                         pass
 
-                display_name = output_name
-                if intro:
-                    display_name = f"{intro.stem}_{output_name}"
-                self.queue.put(("title_slot", slot_idx, f"正在处理: {display_name}"))
-                self.queue.put(("log_slot", slot_idx, f"开始: {display_name}"))
-                
-                on_proc = lambda p: self.register_proc(p, output_path)
-                is_three = middle is not None
-                use_intro_local = intro is not None
-                combined_output = output_path
-                combined_name = output_name
-                temp_output = None
-                if use_intro_local:
-                    combined_name = f"{intro.stem}_{output_name}"
-                    temp_output = output_path.with_name(output_path.stem + "_body.mp4")
-                    combined_output = temp_output
-                
-                if mode == "auto":
-                    if is_three and is_copy_compatible_for_three(ffprobe, first, middle, last):
-                        ok, logtxt = concat_copy_three(ffmpeg, first, middle, last, combined_output, stop_event=self.stop_event, on_proc=on_proc)
-                        if ok:
-                            self.queue.put(("log_slot", slot_idx, "无损合并成功"))
-                            return True, "copy"
-                        self.queue.put(("log_slot", slot_idx, "无损失败，转兼容..."))
-                    elif not is_three and is_copy_compatible(ffprobe, first, last):
-                        ok, logtxt = concat_copy(ffmpeg, first, last, combined_output, stop_event=self.stop_event, on_proc=on_proc)
-                        if ok:
-                            self.queue.put(("log_slot", slot_idx, "无损合并成功"))
-                            return True, "copy"
-                        self.queue.put(("log_slot", slot_idx, "无损失败，转兼容..."))
-                
+                self.queue.put(("title_slot", slot_idx, f"正在处理: {output_name}"))
+                self.queue.put(("log_slot", slot_idx, f"开始: {output_name}"))
+
+                on_proc = lambda proc: self.register_proc(proc, output_path)
+                video_list = list(video_paths)
+
+                if mode == "auto" and is_copy_compatible_many(ffprobe, video_list):
+                    ok, logtxt = concat_copy_many(ffmpeg, video_list, output_path, stop_event=self.stop_event, on_proc=on_proc)
+                    if ok:
+                        self.queue.put(("log_slot", slot_idx, "无损合并成功"))
+                        return True, "copy"
+                    self.queue.put(("log_slot", slot_idx, "无损失败，转兼容..."))
+
                 if resolution_mode == "custom":
                     target_resolution = custom_resolution
                 else:
-                    target_resolution = probe_resolution(ffprobe, first)
+                    target_resolution = probe_resolution(ffprobe, video_list[0])
                     if not target_resolution:
-                        return False, f"无法获取分辨率: {first.name}"
-                
-                if is_three:
-                    total_duration = (probe_duration(ffprobe, first) or 0.0) + (probe_duration(ffprobe, middle) or 0.0) + (probe_duration(ffprobe, last) or 0.0)
-                else:
-                    total_duration = (probe_duration(ffprobe, first) or 0.0) + (probe_duration(ffprobe, last) or 0.0)
-                
+                        return False, f"无法获取分辨率: {video_list[0].name}"
+
+                total_duration = sum((probe_duration(ffprobe, video_path) or 0.0) for video_path in video_list)
+
                 def on_progress_task(remaining):
-                    m = int(remaining // 60)
-                    s = int(remaining % 60)
-                    self.queue.put(("title_slot", slot_idx, f"{combined_name} (ETA: {m:02d}:{s:02d})"))
+                    minutes = int(remaining // 60)
+                    seconds = int(remaining % 60)
+                    self.queue.put(("title_slot", slot_idx, f"{output_name} (ETA: {minutes:02d}:{seconds:02d})"))
                     self.queue.put(("eta", remaining))
 
-                if is_three:
-                    ok, logtxt, audio_kept = concat_reencode_three(
-                        ffmpeg,
-                        ffprobe,
-                        first,
-                        middle,
-                        last,
-                        combined_output,
-                        target_resolution,
-                        progress_total=total_duration,
-                        on_progress=on_progress_task,
-                        on_proc=on_proc,
-                    )
-                else:
-                    ok, logtxt, audio_kept = concat_reencode(
-                        ffmpeg,
-                        ffprobe,
-                        first,
-                        last,
-                        combined_output,
-                        target_resolution,
-                        progress_total=total_duration,
-                        on_progress=on_progress_task,
-                        on_proc=on_proc,
-                    )
-                
-                if use_intro_local and ok:
-                    intro_output = output_path.with_name(combined_name)
-                    ok, logtxt = concat_copy(ffmpeg, intro, combined_output, intro_output, stop_event=self.stop_event, on_proc=on_proc)
-                    try:
-                        if temp_output and temp_output.exists():
-                            os.remove(temp_output)
-                    except Exception:
-                        pass
-                    if ok:
-                        self.queue.put(("log_slot", slot_idx, "开头顺序拼接成功"))
-                        return True, "copy"
-                    safe_remove(intro_output)
-                    self.queue.put(("log_slot", slot_idx, f"开头拼接失败: {logtxt}"))
-                    return False, logtxt
+                ok, logtxt, _audio_kept = concat_reencode_many(
+                    ffmpeg,
+                    ffprobe,
+                    video_list,
+                    output_path,
+                    target_resolution,
+                    progress_total=total_duration,
+                    on_progress=on_progress_task,
+                    on_proc=on_proc,
+                )
 
                 if ok:
                     self.queue.put(("log_slot", slot_idx, "兼容合并成功"))
                 else:
-                    safe_remove(combined_output)
+                    safe_remove(output_path)
                     self.queue.put(("log_slot", slot_idx, f"失败: {logtxt}"))
-                    
-                return (ok, "reencode" if ok else logtxt)
+                return ok, "reencode" if ok else logtxt
             finally:
                 self.queue.put(("title_slot", slot_idx, f"线程 #{slot_idx+1}: 空闲"))
                 self.thread_slots.put(slot_idx)
@@ -1328,13 +1053,10 @@ class App:
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {}
-                for idx, (first, middle, last, output_name, output_path) in enumerate(combinations):
+                for video_paths, output_name, output_path in combinations:
                     if self.stop_event.is_set():
                         break
-                    intro = None
-                    if use_intro:
-                        intro = intros[idx % len(intros)]
-                    future = executor.submit(merge_combination, first, middle, last, output_name, output_path, intro=intro, intro_index=idx)
+                    future = executor.submit(merge_combination, video_paths, output_name, output_path)
                     future_map[future] = (output_name, output_path)
                 for future in as_completed(future_map):
                     output_name, output_path = future_map[future]
@@ -1379,11 +1101,11 @@ class App:
                 elif action == "log_slot":
                     slot_idx, text = item[1], item[2]
                     if 0 <= slot_idx < len(self.log_panels):
-                        txt = self.log_panels[slot_idx]["text"]
-                        txt.configure(state="normal")
-                        txt.insert("end", text + "\n")
-                        txt.configure(state="disabled")
-                        txt.see("end")
+                        text_widget = self.log_panels[slot_idx]["text"]
+                        text_widget.configure(state="normal")
+                        text_widget.insert("end", text + "\n")
+                        text_widget.configure(state="disabled")
+                        text_widget.see("end")
                 elif action == "title_slot":
                     slot_idx, text = item[1], item[2]
                     if 0 <= slot_idx < len(self.log_panels):
@@ -1397,9 +1119,9 @@ class App:
                     self.progress_canvas.coords(self.progress_bar_rect, 0, 0, fill_width, 16)
                 elif action == "eta":
                     remaining = float(item[1])
-                    m = int(remaining // 60)
-                    s = int(remaining % 60)
-                    self.eta_label.configure(text=f"剩余时间估算：{m:02d}:{s:02d}")
+                    minutes = int(remaining // 60)
+                    seconds = int(remaining % 60)
+                    self.eta_label.configure(text=f"剩余时间估算：{minutes:02d}:{seconds:02d}")
                 elif action == "done":
                     self.start_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
@@ -1421,20 +1143,20 @@ class App:
                 outs = list(self.running_outputs)
                 self.running_procs.clear()
                 self.running_outputs.clear()
-            for p in procs:
+            for proc in procs:
                 try:
-                    p.terminate()
+                    proc.terminate()
                 except Exception:
                     pass
                 try:
-                    p.kill()
+                    proc.kill()
                 except Exception:
                     pass
-            for out in outs:
+            for output in outs:
                 try:
-                    if Path(out).exists():
-                        os.remove(out)
-                        self.log(f"已删除未完成文件: {Path(out).name}")
+                    if Path(output).exists():
+                        os.remove(output)
+                        self.log(f"已删除未完成文件: {Path(output).name}")
                 except Exception:
                     pass
         finally:
@@ -1442,26 +1164,25 @@ class App:
 
     def update_counts(self):
         try:
-            i = self.intro_dir.get()
-            f = self.front_dir.get()
-            m = self.middle_dir.get()
-            b = self.back_dir.get()
-            ic = len(list_videos(i)) if i else 0
-            fc = len(list_videos(f)) if f else 0
-            mc = len(list_videos(m)) if m else 0
-            bc = len(list_videos(b)) if b else 0
-            self.intro_count_var.set(f"共 {ic} 个视频")
-            self.front_count_var.set(f"共 {fc} 个视频")
-            self.middle_count_var.set(f"共 {mc} 个视频")
-            self.back_count_var.set(f"共 {bc} 个视频")
-            total = fc * bc if mc == 0 else fc * mc * bc
+            front_count = len(list_videos(self.front_dir.get())) if self.front_dir.get() else 0
+            middle_count = len(list_videos(self.middle_dir.get())) if self.middle_dir.get() else 0
+            back_count = len(list_videos(self.back_dir.get())) if self.back_dir.get() else 0
+            random_count = len(list_videos(self.random_dir.get())) if self.random_dir.get() else 0
+            pick_count = int(self.random_pick_count.get() or 2)
+
+            self.front_count_var.set(f"共 {front_count} 个视频")
+            self.middle_count_var.set(f"共 {middle_count} 个视频")
+            self.back_count_var.set(f"共 {back_count} 个视频")
+            self.random_dir_count_var.set(f"共 {random_count} 个视频")
+            self.random_pick_info_var.set(f"当前拼接数量：{pick_count} 段")
+
+            if self.tab_mode.get() == "structured":
+                total = front_count * back_count if middle_count == 0 else front_count * middle_count * back_count
+            else:
+                total = self.count_random_outputs(random_count, pick_count)
             self.estimated_var.set(f"预计输出数量：{total}")
         except Exception:
             pass
- 
-def build_scale_filter(width, height):
-    return f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
-
 
 
 def main():
