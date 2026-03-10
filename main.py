@@ -220,9 +220,10 @@ def get_transition_profile(profile_name, light_transition_seconds=None):
 
 
 def get_transition_variant_params(use_hardware):
+    # Transition assets are temporary building blocks; bias toward smaller size while keeping fast encoding.
     if use_hardware:
-        return ["-c:v", "h264_videotoolbox", "-b:v", "5000k", "-allow_sw", "1"]
-    return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28"]
+        return ["-c:v", "h264_videotoolbox", "-b:v", "2200k", "-maxrate", "2600k", "-bufsize", "4400k", "-allow_sw", "1"]
+    return ["-c:v", "libx264", "-preset", "superfast", "-crf", "30"]
 
 
 def render_transition_variant(ffmpeg, ffprobe, source_path, output_path, target_resolution, fade_in, fade_out, fade_duration, include_audio):
@@ -248,7 +249,7 @@ def render_transition_variant(ffmpeg, ffprobe, source_path, output_path, target_
         if fade_out and actual_fade > 0:
             fade_start = max(0.0, source_duration - actual_fade)
             audio_filter += f",afade=t=out:st={fade_start:.3f}:d={actual_fade:.3f}"
-        cmd += ["-af", audio_filter, "-c:a", "aac", "-b:a", "128k"]
+        cmd += ["-af", audio_filter, "-c:a", "aac", "-b:a", "96k"]
     else:
         cmd += ["-an"]
 
@@ -265,7 +266,7 @@ def render_transition_variant(ffmpeg, ffprobe, source_path, output_path, target_
             if fade_out and actual_fade > 0:
                 fade_start = max(0.0, source_duration - actual_fade)
                 audio_filter += f",afade=t=out:st={fade_start:.3f}:d={actual_fade:.3f}"
-            fallback_cmd += ["-af", audio_filter, "-c:a", "aac", "-b:a", "128k"]
+            fallback_cmd += ["-af", audio_filter, "-c:a", "aac", "-b:a", "96k"]
         else:
             fallback_cmd += ["-an"]
         fallback_cmd += ["-movflags", "+faststart", str(output_path)]
@@ -292,7 +293,7 @@ def render_transition_gap(ffmpeg, output_path, target_resolution, gap_duration, 
             cmd += ["-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={gap_duration:.3f}"]
         cmd += get_transition_variant_params(use_hardware)
         if include_audio:
-            cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
+            cmd += ["-c:a", "aac", "-b:a", "96k", "-shortest"]
         else:
             cmd += ["-an"]
         cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path)]
@@ -310,12 +311,24 @@ def render_transition_gap(ffmpeg, output_path, target_resolution, gap_duration, 
     return False, out + err
 
 
-def prepare_transition_assets(ffmpeg, ffprobe, video_paths, target_resolution, transition_profile, light_transition_seconds, cache_dir, cache, cache_lock):
+def prepare_transition_assets(ffmpeg, ffprobe, video_paths, target_resolution, transition_profile, light_transition_seconds, cache_dir, cache, inflight, cache_lock):
     include_audio = all(probe_has_audio(ffprobe, video_path) for video_path in video_paths)
     profile = get_transition_profile(transition_profile, light_transition_seconds)
     fade_duration = profile["fade_duration"]
     gap_duration = profile["gap_duration"]
     prepared_paths = []
+
+    def wait_for_existing_job(key):
+        with cache_lock:
+            event = inflight.get(key)
+        if not event:
+            return None
+        event.wait()
+        with cache_lock:
+            cached_path = cache.get(key)
+        if cached_path and Path(cached_path).exists():
+            return Path(cached_path), True, ""
+        return None
 
     def get_or_create_variant(source_path, fade_in, fade_out):
         key = (str(source_path), target_resolution, transition_profile, light_transition_seconds, include_audio, fade_in, fade_out)
@@ -323,21 +336,36 @@ def prepare_transition_assets(ffmpeg, ffprobe, video_paths, target_resolution, t
             cached_path = cache.get(key)
             if cached_path and Path(cached_path).exists():
                 return Path(cached_path), True, ""
-            output_path = Path(cache_dir) / f"variant_{abs(hash(key))}.mp4"
-            ok, logtxt = render_transition_variant(
-                ffmpeg,
-                ffprobe,
-                source_path,
-                output_path,
-                target_resolution,
-                fade_in,
-                fade_out,
-                fade_duration,
-                include_audio,
-            )
+            existing_event = inflight.get(key)
+            if existing_event is None:
+                existing_event = threading.Event()
+                inflight[key] = existing_event
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            waited = wait_for_existing_job(key)
+            if waited:
+                return waited
+            return Path(cache_dir) / f"variant_{abs(hash(key))}.mp4", False, "转场缓存生成失败"
+
+        output_path = Path(cache_dir) / f"variant_{abs(hash(key))}.mp4"
+        ok, logtxt = render_transition_variant(
+            ffmpeg,
+            ffprobe,
+            source_path,
+            output_path,
+            target_resolution,
+            fade_in,
+            fade_out,
+            fade_duration,
+            include_audio,
+        )
+        with cache_lock:
             if ok:
                 cache[key] = str(output_path)
-            return output_path, ok, logtxt
+            inflight.pop(key, None).set()
+        return output_path, ok, logtxt
 
     def get_or_create_gap():
         key = ("gap", target_resolution, transition_profile, light_transition_seconds, include_audio)
@@ -345,11 +373,26 @@ def prepare_transition_assets(ffmpeg, ffprobe, video_paths, target_resolution, t
             cached_path = cache.get(key)
             if cached_path and Path(cached_path).exists():
                 return Path(cached_path), True, ""
-            output_path = Path(cache_dir) / f"gap_{abs(hash(key))}.mp4"
-            ok, logtxt = render_transition_gap(ffmpeg, output_path, target_resolution, gap_duration, include_audio)
+            existing_event = inflight.get(key)
+            if existing_event is None:
+                existing_event = threading.Event()
+                inflight[key] = existing_event
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            waited = wait_for_existing_job(key)
+            if waited:
+                return waited
+            return Path(cache_dir) / f"gap_{abs(hash(key))}.mp4", False, "转场缓存生成失败"
+
+        output_path = Path(cache_dir) / f"gap_{abs(hash(key))}.mp4"
+        ok, logtxt = render_transition_gap(ffmpeg, output_path, target_resolution, gap_duration, include_audio)
+        with cache_lock:
             if ok:
                 cache[key] = str(output_path)
-            return output_path, ok, logtxt
+            inflight.pop(key, None).set()
+        return output_path, ok, logtxt
 
     for index, video_path in enumerate(video_paths):
         fade_in = index > 0
@@ -636,7 +679,7 @@ class App:
         self.output_dir = StringVar()
         self.random_pick_count = IntVar(value=2)
         self.transition_enabled = BooleanVar(value=False)
-        self.transition_profile = StringVar(value="极速")
+        self.transition_profile = StringVar(value="轻量")
         self.light_transition_seconds = StringVar(value=DEFAULT_LIGHT_TRANSITION_SECONDS)
         self.mode = StringVar(value="优先无损（失败自动转兼容）")
         self.resolution_mode = StringVar(value="custom")
@@ -856,61 +899,28 @@ class App:
         row5 = tk.Frame(options_frame, bg=bg_color)
         row5.grid(row=5, column=0, sticky="ew", pady=4)
         tk.Label(row5, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
-        tk.Label(row5, text="转场模式", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
-        fast_radio = tk.Radiobutton(
-            row5,
-            text="极速转场",
-            variable=self.transition_profile,
-            value="极速",
-            command=self.refresh_transition_state,
-            font=font_normal,
-            bg=bg_color,
-            fg=fg_color,
-            activebackground=bg_color,
-            activeforeground=fg_color,
-        )
-        fast_radio.grid(row=0, column=2, sticky="w", padx=(10, 0))
-        light_radio = tk.Radiobutton(
-            row5,
-            text="轻量转场",
-            variable=self.transition_profile,
-            value="轻量",
-            command=self.refresh_transition_state,
-            font=font_normal,
-            bg=bg_color,
-            fg=fg_color,
-            activebackground=bg_color,
-            activeforeground=fg_color,
-        )
-        light_radio.grid(row=0, column=3, sticky="w", padx=(12, 0))
-
-        row6 = tk.Frame(options_frame, bg=bg_color)
-        row6.grid(row=6, column=0, sticky="ew", pady=4)
-        tk.Label(row6, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
-        tk.Label(row6, text="轻量时长", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
-        light_duration_menu = tk.OptionMenu(row6, self.light_transition_seconds, *LIGHT_TRANSITION_OPTIONS)
+        tk.Label(row5, text="轻量时长", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        light_duration_menu = tk.OptionMenu(row5, self.light_transition_seconds, *LIGHT_TRANSITION_OPTIONS)
         light_duration_menu.config(width=8, font=font_normal, bg="white", fg=fg_color, highlightthickness=0)
         light_duration_menu["menu"].config(bg="white", fg=fg_color, font=font_normal)
         light_duration_menu.grid(row=0, column=2, sticky="w", padx=(10, 0))
-        tk.Label(row6, text="秒", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=3, sticky="w", padx=(6, 0))
+        tk.Label(row5, text="秒", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=3, sticky="w", padx=(6, 0))
 
-        row7 = tk.Frame(options_frame, bg=bg_color)
-        row7.grid(row=7, column=0, sticky="ew", pady=(0, 4))
-        tk.Label(row7, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        row6 = tk.Frame(options_frame, bg=bg_color)
+        row6.grid(row=6, column=0, sticky="ew", pady=(0, 4))
+        tk.Label(row6, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
         self.transition_hint_label = tk.Label(
-            row7,
-            text="提示：极速转场速度最快；轻量转场支持更长时长，效果更明显但会更慢。",
+            row6,
+            text="提示：当前仅保留轻量转场；时长越长，过渡越明显，但处理会更慢。",
             font=font_small,
             bg=bg_color,
             fg="#666666",
         )
         self.transition_hint_label.grid(row=0, column=1, sticky="w", padx=(10, 0))
 
-        self.light_transition_row = row6
+        self.light_transition_row = row5
         self.light_duration_menu = light_duration_menu
-        self.transition_profile_radios = [fast_radio, light_radio]
         self.transition_enabled.trace_add("write", lambda *args: self.refresh_transition_state())
-        self.transition_profile.trace_add("write", lambda *args: self.refresh_transition_state())
         progress_section = tk.Frame(container, bg=bg_color)
         progress_section.grid(row=3, column=0, sticky="ew", pady=(0, 15))
         tk.Label(progress_section, text="任务进度", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=0, sticky="w", pady=(0, 8))
@@ -1038,11 +1048,7 @@ class App:
 
     def refresh_transition_state(self):
         enabled = self.transition_enabled.get()
-        state = "normal" if enabled else "disabled"
-        for radio in self.transition_profile_radios:
-            radio.configure(state=state)
-        show_light_options = enabled and self.transition_profile.get() == "轻量"
-        if show_light_options:
+        if enabled:
             self.light_transition_row.grid()
             self.light_duration_menu.configure(state="normal")
         else:
@@ -1273,6 +1279,7 @@ class App:
 
         transition_cache_dir = tempfile.mkdtemp(prefix="video_mix_transition_cache_")
         transition_cache = {}
+        transition_inflight = {}
         transition_cache_lock = threading.Lock()
 
         combinations = []
@@ -1355,10 +1362,7 @@ class App:
 
                 if transition_enabled and len(video_list) > 1:
                     profile = get_transition_profile(transition_profile, light_transition_seconds)
-                    if transition_profile == "轻量":
-                        self.queue.put(("log_slot", slot_idx, f"启用转场：轻量转场 {profile['total_seconds']:.1f}秒"))
-                    else:
-                        self.queue.put(("log_slot", slot_idx, "启用转场：极速转场"))
+                    self.queue.put(("log_slot", slot_idx, f"启用转场：轻量转场 {profile['total_seconds']:.1f}秒"))
                     ok, logtxt, prepared_paths = prepare_transition_assets(
                         ffmpeg,
                         ffprobe,
@@ -1368,6 +1372,7 @@ class App:
                         light_transition_seconds,
                         transition_cache_dir,
                         transition_cache,
+                        transition_inflight,
                         transition_cache_lock,
                     )
                     if not ok:
