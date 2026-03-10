@@ -17,7 +17,13 @@ from tkinter.scrolledtext import ScrolledText
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v"}
-APP_VERSION = "2026-02-21-middle"
+APP_VERSION = "2026-03-10-fast-transition"
+
+TRANSITION_PROFILES = {
+    "极速": {"fade_duration": 0.08, "gap_duration": 0.0},
+}
+LIGHT_TRANSITION_OPTIONS = ["0.4", "0.6", "0.8", "1.0"]
+DEFAULT_LIGHT_TRANSITION_SECONDS = "0.6"
 
 
 def list_videos(directory):
@@ -184,6 +190,183 @@ def build_scale_filter(width, height):
     return f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
 
 
+def build_transition_scale_filter(width, height):
+    return f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1,format=yuv420p"
+
+
+def resolve_transition_duration(requested_duration, clip_durations):
+    if not clip_durations:
+        return None
+    min_duration = min(clip_durations)
+    max_allowed = max(0.0, (min_duration / 2.0) - 0.02)
+    if max_allowed <= 0:
+        return None
+    return min(requested_duration, max_allowed)
+
+
+def get_transition_profile(profile_name, light_transition_seconds=None):
+    if profile_name == "轻量":
+        try:
+            total_seconds = float(light_transition_seconds or DEFAULT_LIGHT_TRANSITION_SECONDS)
+        except Exception:
+            total_seconds = float(DEFAULT_LIGHT_TRANSITION_SECONDS)
+        total_seconds = max(0.2, total_seconds)
+        gap_duration = round(total_seconds * 0.2, 3)
+        fade_duration = round(max(0.08, (total_seconds - gap_duration) / 2.0), 3)
+        return {"fade_duration": fade_duration, "gap_duration": gap_duration, "total_seconds": round(fade_duration * 2 + gap_duration, 3)}
+    profile = TRANSITION_PROFILES.get(profile_name, TRANSITION_PROFILES["极速"]).copy()
+    profile["total_seconds"] = round(profile["fade_duration"] * 2 + profile["gap_duration"], 3)
+    return profile
+
+
+def get_transition_variant_params(use_hardware):
+    if use_hardware:
+        return ["-c:v", "h264_videotoolbox", "-b:v", "5000k", "-allow_sw", "1"]
+    return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28"]
+
+
+def render_transition_variant(ffmpeg, ffprobe, source_path, output_path, target_resolution, fade_in, fade_out, fade_duration, include_audio):
+    width, height = target_resolution
+    source_duration = probe_duration(ffprobe, source_path) or 0.0
+    actual_fade = resolve_transition_duration(fade_duration, [source_duration]) or 0.0
+    video_filters = [build_transition_scale_filter(width, height)]
+    if fade_in and actual_fade > 0:
+        video_filters.append(f"fade=t=in:st=0:d={actual_fade:.3f}:color=black")
+    if fade_out and actual_fade > 0:
+        fade_start = max(0.0, source_duration - actual_fade)
+        video_filters.append(f"fade=t=out:st={fade_start:.3f}:d={actual_fade:.3f}:color=black")
+
+    cmd = [ffmpeg, "-y", "-i", str(source_path), "-vf", ",".join(video_filters)]
+    use_hardware = sys.platform == "darwin"
+    cmd += get_transition_variant_params(use_hardware)
+
+    source_has_audio = probe_has_audio(ffprobe, source_path)
+    if include_audio and source_has_audio:
+        audio_filter = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"
+        if fade_in and actual_fade > 0:
+            audio_filter += f",afade=t=in:st=0:d={actual_fade:.3f}"
+        if fade_out and actual_fade > 0:
+            fade_start = max(0.0, source_duration - actual_fade)
+            audio_filter += f",afade=t=out:st={fade_start:.3f}:d={actual_fade:.3f}"
+        cmd += ["-af", audio_filter, "-c:a", "aac", "-b:a", "128k"]
+    else:
+        cmd += ["-an"]
+
+    cmd += ["-movflags", "+faststart", str(output_path)]
+    code, out, err = run_command(cmd)
+    if code == 0:
+        return True, out + err
+    if use_hardware:
+        fallback_cmd = [ffmpeg, "-y", "-i", str(source_path), "-vf", ",".join(video_filters)] + get_transition_variant_params(False)
+        if include_audio and source_has_audio:
+            audio_filter = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"
+            if fade_in and actual_fade > 0:
+                audio_filter += f",afade=t=in:st=0:d={actual_fade:.3f}"
+            if fade_out and actual_fade > 0:
+                fade_start = max(0.0, source_duration - actual_fade)
+                audio_filter += f",afade=t=out:st={fade_start:.3f}:d={actual_fade:.3f}"
+            fallback_cmd += ["-af", audio_filter, "-c:a", "aac", "-b:a", "128k"]
+        else:
+            fallback_cmd += ["-an"]
+        fallback_cmd += ["-movflags", "+faststart", str(output_path)]
+        code, out2, err2 = run_command(fallback_cmd)
+        return code == 0, out + err + out2 + err2
+    return False, out + err
+
+
+def render_transition_gap(ffmpeg, output_path, target_resolution, gap_duration, include_audio):
+    width, height = target_resolution
+    if gap_duration <= 0:
+        return False, ""
+
+    def build_gap_cmd(use_hardware):
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:s={width}x{height}:d={gap_duration:.3f}:r=30",
+        ]
+        if include_audio:
+            cmd += ["-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={gap_duration:.3f}"]
+        cmd += get_transition_variant_params(use_hardware)
+        if include_audio:
+            cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
+        else:
+            cmd += ["-an"]
+        cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path)]
+        return cmd
+
+    use_hardware = sys.platform == "darwin"
+    cmd = build_gap_cmd(use_hardware)
+    code, out, err = run_command(cmd)
+    if code == 0:
+        return True, out + err
+    if use_hardware:
+        fallback_cmd = build_gap_cmd(False)
+        code, out2, err2 = run_command(fallback_cmd)
+        return code == 0, out + err + out2 + err2
+    return False, out + err
+
+
+def prepare_transition_assets(ffmpeg, ffprobe, video_paths, target_resolution, transition_profile, light_transition_seconds, cache_dir, cache, cache_lock):
+    include_audio = all(probe_has_audio(ffprobe, video_path) for video_path in video_paths)
+    profile = get_transition_profile(transition_profile, light_transition_seconds)
+    fade_duration = profile["fade_duration"]
+    gap_duration = profile["gap_duration"]
+    prepared_paths = []
+
+    def get_or_create_variant(source_path, fade_in, fade_out):
+        key = (str(source_path), target_resolution, transition_profile, light_transition_seconds, include_audio, fade_in, fade_out)
+        with cache_lock:
+            cached_path = cache.get(key)
+            if cached_path and Path(cached_path).exists():
+                return Path(cached_path), True, ""
+            output_path = Path(cache_dir) / f"variant_{abs(hash(key))}.mp4"
+            ok, logtxt = render_transition_variant(
+                ffmpeg,
+                ffprobe,
+                source_path,
+                output_path,
+                target_resolution,
+                fade_in,
+                fade_out,
+                fade_duration,
+                include_audio,
+            )
+            if ok:
+                cache[key] = str(output_path)
+            return output_path, ok, logtxt
+
+    def get_or_create_gap():
+        key = ("gap", target_resolution, transition_profile, light_transition_seconds, include_audio)
+        with cache_lock:
+            cached_path = cache.get(key)
+            if cached_path and Path(cached_path).exists():
+                return Path(cached_path), True, ""
+            output_path = Path(cache_dir) / f"gap_{abs(hash(key))}.mp4"
+            ok, logtxt = render_transition_gap(ffmpeg, output_path, target_resolution, gap_duration, include_audio)
+            if ok:
+                cache[key] = str(output_path)
+            return output_path, ok, logtxt
+
+    for index, video_path in enumerate(video_paths):
+        fade_in = index > 0
+        fade_out = index < len(video_paths) - 1
+        prepared_path, ok, logtxt = get_or_create_variant(video_path, fade_in, fade_out)
+        if not ok:
+            return False, logtxt, []
+        prepared_paths.append(prepared_path)
+        if gap_duration > 0 and index < len(video_paths) - 1:
+            gap_path, ok, logtxt = get_or_create_gap()
+            if not ok:
+                return False, logtxt, []
+            prepared_paths.append(gap_path)
+
+    return True, "", prepared_paths
+
+
 def concat_copy_many(ffmpeg, video_paths, output, stop_event=None, on_proc=None):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
     try:
@@ -257,59 +440,107 @@ def concat_copy_four(ffmpeg, first, second, third, fourth, output, stop_event=No
     return concat_copy_many(ffmpeg, [first, second, third, fourth], output, stop_event=stop_event, on_proc=on_proc)
 
 
-def concat_reencode_many(ffmpeg, ffprobe, video_paths, output, target_resolution, progress_total=None, on_progress=None, on_proc=None):
+def concat_reencode_many(
+    ffmpeg,
+    ffprobe,
+    video_paths,
+    output,
+    target_resolution,
+    progress_total=None,
+    on_progress=None,
+    on_proc=None,
+    transition_name=None,
+    transition_duration=0.0,
+    clip_durations=None,
+):
     width, height = target_resolution
-    video_filter = build_scale_filter(width, height)
+    clip_durations = clip_durations or [probe_duration(ffprobe, video_path) or 0.0 for video_path in video_paths]
+    transition_active = bool(transition_name and len(video_paths) > 1)
+    effective_transition_duration = 0.0
+    if transition_active:
+        effective_transition_duration = resolve_transition_duration(transition_duration, clip_durations)
+        if not effective_transition_duration:
+            return False, "视频时长过短，无法应用转场效果", False
+
+    video_filter = build_transition_scale_filter(width, height) if transition_active else build_scale_filter(width, height)
     has_audio_flags = [probe_has_audio(ffprobe, video_path) for video_path in video_paths]
     all_have_audio = all(has_audio_flags)
-    use_videotoolbox = sys.platform == "darwin"
+    use_videotoolbox = sys.platform == "darwin" and not transition_active
     if use_videotoolbox:
         v_params = ["-c:v", "h264_videotoolbox", "-b:v", "10000k", "-allow_sw", "1"]
     else:
         v_params = ["-c:v", "libx264", "-crf", "23", "-preset", "veryfast"]
 
-    video_parts = [f"[{index}:v]{video_filter}[v{index}]" for index, _ in enumerate(video_paths)]
     cmd = [ffmpeg, "-y"]
     for video_path in video_paths:
         cmd.extend(["-i", str(video_path)])
 
+    video_parts = [f"[{index}:v]{video_filter}[v{index}]" for index, _ in enumerate(video_paths)]
+    filter_parts = list(video_parts)
+    current_video_label = "[v0]"
+
+    if transition_active:
+        offset = max(0.0, clip_durations[0] - effective_transition_duration)
+        for index in range(1, len(video_paths)):
+            output_label = f"[vx{index}]"
+            filter_parts.append(
+                f"{current_video_label}[v{index}]xfade=transition={transition_name}:duration={effective_transition_duration}:offset={offset:.3f}{output_label}"
+            )
+            current_video_label = output_label
+            offset += max(0.0, clip_durations[index] - effective_transition_duration)
+    else:
+        concat_inputs = "".join(f"[v{index}]" for index, _ in enumerate(video_paths))
+        filter_parts.append(f"{concat_inputs}concat=n={len(video_paths)}:v=1:a=0[v]")
+        current_video_label = "[v]"
+
+    audio_map = []
     if all_have_audio:
         audio_parts = [
             f"[{index}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a{index}]"
             for index, _ in enumerate(video_paths)
         ]
-        concat_inputs = "".join(f"[v{index}][a{index}]" for index, _ in enumerate(video_paths))
-        filter_complex = ";".join(video_parts + audio_parts + [f"{concat_inputs}concat=n={len(video_paths)}:v=1:a=1[v][a]"])
-        cmd += [
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[v]",
-            "-map",
-            "[a]",
-        ] + v_params + [
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
+        filter_parts.extend(audio_parts)
+        if transition_active:
+            current_audio_label = "[a0]"
+            for index in range(1, len(video_paths)):
+                output_label = f"[ax{index}]"
+                filter_parts.append(
+                    f"{current_audio_label}[a{index}]acrossfade=d={effective_transition_duration}:c1=tri:c2=tri{output_label}"
+                )
+                current_audio_label = output_label
+            audio_map = ["-map", current_audio_label, "-c:a", "aac", "-b:a", "192k"]
+        else:
+            concat_inputs = "".join(f"[v{index}][a{index}]" for index, _ in enumerate(video_paths))
+            filter_parts[-1] = f"{concat_inputs}concat=n={len(video_paths)}:v=1:a=1[v][a]"
+            current_video_label = "[v]"
+            audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
+            filter_parts = video_parts + audio_parts + [filter_parts[-1]]
+
+    if not transition_active and all_have_audio:
+        filter_complex = ";".join(filter_parts)
+    elif not all_have_audio:
+        if transition_active:
+            filter_complex = ";".join(filter_parts)
+        else:
+            filter_complex = ";".join(video_parts + [f"{''.join(f'[v{index}]' for index, _ in enumerate(video_paths))}concat=n={len(video_paths)}:v=1:a=0[v]"])
+            current_video_label = "[v]"
     else:
-        concat_inputs = "".join(f"[v{index}]" for index, _ in enumerate(video_paths))
-        filter_complex = ";".join(video_parts + [f"{concat_inputs}concat=n={len(video_paths)}:v=1:a=0[v]"])
-        cmd += [
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[v]",
-        ] + v_params + [
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-    cmd = cmd + ["-progress", "pipe:1", "-nostats"]
+        filter_complex = ";".join(filter_parts)
+
+    cmd += [
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        current_video_label,
+    ] + audio_map + v_params + [
+        "-movflags",
+        "+faststart",
+        str(output),
+        "-progress",
+        "pipe:1",
+        "-nostats",
+    ]
+
     try:
         startupinfo = None
         if sys.platform == "win32":
@@ -404,6 +635,9 @@ class App:
         self.random_dir = StringVar()
         self.output_dir = StringVar()
         self.random_pick_count = IntVar(value=2)
+        self.transition_enabled = BooleanVar(value=False)
+        self.transition_profile = StringVar(value="极速")
+        self.light_transition_seconds = StringVar(value=DEFAULT_LIGHT_TRANSITION_SECONDS)
         self.mode = StringVar(value="优先无损（失败自动转兼容）")
         self.resolution_mode = StringVar(value="custom")
         self.custom_width = IntVar(value=1080)
@@ -600,6 +834,83 @@ class App:
             row=0, column=1, sticky="w", padx=(10, 0)
         )
 
+        transition_title_row = tk.Frame(options_frame, bg=bg_color)
+        transition_title_row.grid(row=3, column=0, sticky="ew", pady=(10, 2))
+        tk.Label(transition_title_row, text="转场效果", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=0, sticky="w")
+
+        row4 = tk.Frame(options_frame, bg=bg_color)
+        row4.grid(row=4, column=0, sticky="ew", pady=4)
+        tk.Label(row4, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        tk.Checkbutton(
+            row4,
+            text="启用转场效果",
+            variable=self.transition_enabled,
+            command=self.refresh_transition_state,
+            font=font_normal,
+            bg=bg_color,
+            fg=fg_color,
+            activebackground=bg_color,
+            activeforeground=fg_color,
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        row5 = tk.Frame(options_frame, bg=bg_color)
+        row5.grid(row=5, column=0, sticky="ew", pady=4)
+        tk.Label(row5, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        tk.Label(row5, text="转场模式", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        fast_radio = tk.Radiobutton(
+            row5,
+            text="极速转场",
+            variable=self.transition_profile,
+            value="极速",
+            command=self.refresh_transition_state,
+            font=font_normal,
+            bg=bg_color,
+            fg=fg_color,
+            activebackground=bg_color,
+            activeforeground=fg_color,
+        )
+        fast_radio.grid(row=0, column=2, sticky="w", padx=(10, 0))
+        light_radio = tk.Radiobutton(
+            row5,
+            text="轻量转场",
+            variable=self.transition_profile,
+            value="轻量",
+            command=self.refresh_transition_state,
+            font=font_normal,
+            bg=bg_color,
+            fg=fg_color,
+            activebackground=bg_color,
+            activeforeground=fg_color,
+        )
+        light_radio.grid(row=0, column=3, sticky="w", padx=(12, 0))
+
+        row6 = tk.Frame(options_frame, bg=bg_color)
+        row6.grid(row=6, column=0, sticky="ew", pady=4)
+        tk.Label(row6, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        tk.Label(row6, text="轻量时长", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        light_duration_menu = tk.OptionMenu(row6, self.light_transition_seconds, *LIGHT_TRANSITION_OPTIONS)
+        light_duration_menu.config(width=8, font=font_normal, bg="white", fg=fg_color, highlightthickness=0)
+        light_duration_menu["menu"].config(bg="white", fg=fg_color, font=font_normal)
+        light_duration_menu.grid(row=0, column=2, sticky="w", padx=(10, 0))
+        tk.Label(row6, text="秒", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=3, sticky="w", padx=(6, 0))
+
+        row7 = tk.Frame(options_frame, bg=bg_color)
+        row7.grid(row=7, column=0, sticky="ew", pady=(0, 4))
+        tk.Label(row7, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        self.transition_hint_label = tk.Label(
+            row7,
+            text="提示：极速转场速度最快；轻量转场支持更长时长，效果更明显但会更慢。",
+            font=font_small,
+            bg=bg_color,
+            fg="#666666",
+        )
+        self.transition_hint_label.grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        self.light_transition_row = row6
+        self.light_duration_menu = light_duration_menu
+        self.transition_profile_radios = [fast_radio, light_radio]
+        self.transition_enabled.trace_add("write", lambda *args: self.refresh_transition_state())
+        self.transition_profile.trace_add("write", lambda *args: self.refresh_transition_state())
         progress_section = tk.Frame(container, bg=bg_color)
         progress_section.grid(row=3, column=0, sticky="ew", pady=(0, 15))
         tk.Label(progress_section, text="任务进度", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=0, sticky="w", pady=(0, 8))
@@ -641,6 +952,7 @@ class App:
         self.log_text.grid(row=0, column=0, sticky="nsew")
 
         self.refresh_resolution_state()
+        self.refresh_transition_state()
 
         if os.environ.get("VIDEO_MIX_DEBUG_UI") == "1":
             self.root.after(800, self.dump_ui_state)
@@ -723,6 +1035,20 @@ class App:
         else:
             self.width_entry.configure(state="disabled")
             self.height_entry.configure(state="disabled")
+
+    def refresh_transition_state(self):
+        enabled = self.transition_enabled.get()
+        state = "normal" if enabled else "disabled"
+        for radio in self.transition_profile_radios:
+            radio.configure(state=state)
+        show_light_options = enabled and self.transition_profile.get() == "轻量"
+        if show_light_options:
+            self.light_transition_row.grid()
+            self.light_duration_menu.configure(state="normal")
+        else:
+            self.light_transition_row.grid_remove()
+            self.light_duration_menu.configure(state="disabled")
+        self.transition_hint_label.configure(fg="#666666" if enabled else "#b0b0b0")
 
     def pick_front(self):
         path = filedialog.askdirectory()
@@ -808,6 +1134,9 @@ class App:
             "resolution_mode": self.resolution_mode.get(),
             "custom_resolution": (self.custom_width.get(), self.custom_height.get()),
             "skip_existing": self.skip_existing.get(),
+            "transition_enabled": self.transition_enabled.get(),
+            "transition_profile": self.transition_profile.get(),
+            "light_transition_seconds": self.light_transition_seconds.get(),
         }
 
         if strategy == "structured":
@@ -923,6 +1252,9 @@ class App:
         resolution_mode = config["resolution_mode"]
         custom_resolution = config["custom_resolution"]
         skip_existing = config["skip_existing"]
+        transition_enabled = config.get("transition_enabled", False)
+        transition_profile = config.get("transition_profile", "极速")
+        light_transition_seconds = config.get("light_transition_seconds", DEFAULT_LIGHT_TRANSITION_SECONDS)
         ffmpeg = config["ffmpeg"]
         ffprobe = config["ffprobe"]
         max_workers = config.get("max_workers", 1)
@@ -938,6 +1270,10 @@ class App:
         self.thread_slots = queue.Queue()
         for index in range(max_workers):
             self.thread_slots.put(index)
+
+        transition_cache_dir = tempfile.mkdtemp(prefix="video_mix_transition_cache_")
+        transition_cache = {}
+        transition_cache_lock = threading.Lock()
 
         combinations = []
         if strategy == "structured":
@@ -1006,13 +1342,7 @@ class App:
 
                 on_proc = lambda proc: self.register_proc(proc, output_path)
                 video_list = list(video_paths)
-
-                if mode == "auto" and is_copy_compatible_many(ffprobe, video_list):
-                    ok, logtxt = concat_copy_many(ffmpeg, video_list, output_path, stop_event=self.stop_event, on_proc=on_proc)
-                    if ok:
-                        self.queue.put(("log_slot", slot_idx, "无损合并成功"))
-                        return True, "copy"
-                    self.queue.put(("log_slot", slot_idx, "无损失败，转兼容..."))
+                clip_durations = [probe_duration(ffprobe, video_path) or 0.0 for video_path in video_list]
 
                 if resolution_mode == "custom":
                     target_resolution = custom_resolution
@@ -1021,7 +1351,44 @@ class App:
                     if not target_resolution:
                         return False, f"无法获取分辨率: {video_list[0].name}"
 
-                total_duration = sum((probe_duration(ffprobe, video_path) or 0.0) for video_path in video_list)
+                total_duration = sum(clip_durations)
+
+                if transition_enabled and len(video_list) > 1:
+                    profile = get_transition_profile(transition_profile, light_transition_seconds)
+                    if transition_profile == "轻量":
+                        self.queue.put(("log_slot", slot_idx, f"启用转场：轻量转场 {profile['total_seconds']:.1f}秒"))
+                    else:
+                        self.queue.put(("log_slot", slot_idx, "启用转场：极速转场"))
+                    ok, logtxt, prepared_paths = prepare_transition_assets(
+                        ffmpeg,
+                        ffprobe,
+                        video_list,
+                        target_resolution,
+                        transition_profile,
+                        light_transition_seconds,
+                        transition_cache_dir,
+                        transition_cache,
+                        transition_cache_lock,
+                    )
+                    if not ok:
+                        safe_remove(output_path)
+                        self.queue.put(("log_slot", slot_idx, f"转场素材生成失败: {logtxt}"))
+                        return False, logtxt
+                    total_duration = max(0.0, total_duration + profile["gap_duration"] * (len(video_list) - 1))
+                    ok, logtxt = concat_copy_many(ffmpeg, prepared_paths, output_path, stop_event=self.stop_event, on_proc=on_proc)
+                    if ok:
+                        self.queue.put(("log_slot", slot_idx, "转场合并成功"))
+                        return True, "transition"
+                    safe_remove(output_path)
+                    self.queue.put(("log_slot", slot_idx, f"失败: {logtxt}"))
+                    return False, logtxt
+
+                if mode == "auto" and is_copy_compatible_many(ffprobe, video_list):
+                    ok, logtxt = concat_copy_many(ffmpeg, video_list, output_path, stop_event=self.stop_event, on_proc=on_proc)
+                    if ok:
+                        self.queue.put(("log_slot", slot_idx, "无损合并成功"))
+                        return True, "copy"
+                    self.queue.put(("log_slot", slot_idx, "无损失败，转兼容..."))
 
                 def on_progress_task(remaining):
                     minutes = int(remaining // 60)
@@ -1038,6 +1405,7 @@ class App:
                     progress_total=total_duration,
                     on_progress=on_progress_task,
                     on_proc=on_proc,
+                    clip_durations=clip_durations,
                 )
 
                 if ok:
@@ -1082,6 +1450,10 @@ class App:
             self.log("并发执行异常")
             self.log(str(e))
         finally:
+            try:
+                shutil.rmtree(transition_cache_dir, ignore_errors=True)
+            except Exception:
+                pass
             self.finish()
 
     def finish(self):
