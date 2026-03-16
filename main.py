@@ -18,6 +18,8 @@ from tkinter.scrolledtext import ScrolledText
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v"}
 APP_VERSION = "2026-03-10-fast-transition"
+RANDOM_ORDER_DISTINCT = "顺序不同算不同结果"
+RANDOM_ORDER_IGNORE = "顺序不同算同一结果"
 
 TRANSITION_PROFILES = {
     "极速": {"fade_duration": 0.08, "gap_duration": 0.0},
@@ -226,53 +228,113 @@ def get_transition_variant_params(use_hardware):
     return ["-c:v", "libx264", "-preset", "superfast", "-crf", "30"]
 
 
-def render_transition_variant(ffmpeg, ffprobe, source_path, output_path, target_resolution, fade_in, fade_out, fade_duration, include_audio):
-    width, height = target_resolution
-    source_duration = probe_duration(ffprobe, source_path) or 0.0
-    actual_fade = resolve_transition_duration(fade_duration, [source_duration]) or 0.0
-    video_filters = [build_transition_scale_filter(width, height)]
-    if fade_in and actual_fade > 0:
-        video_filters.append(f"fade=t=in:st=0:d={actual_fade:.3f}:color=black")
-    if fade_out and actual_fade > 0:
-        fade_start = max(0.0, source_duration - actual_fade)
-        video_filters.append(f"fade=t=out:st={fade_start:.3f}:d={actual_fade:.3f}:color=black")
+def run_ffmpeg_with_hw_fallback(primary_cmd, fallback_cmd=None):
+    code, out, err = run_command(primary_cmd)
+    if code == 0:
+        return True, out + err
+    if fallback_cmd:
+        code2, out2, err2 = run_command(fallback_cmd)
+        return code2 == 0, out + err + out2 + err2
+    return False, out + err
 
-    cmd = [ffmpeg, "-y", "-i", str(source_path), "-vf", ",".join(video_filters)]
+
+def render_standard_clip(ffmpeg, ffprobe, source_path, output_path, target_resolution, include_audio):
+    width, height = target_resolution
+    cmd = [ffmpeg, "-y", "-i", str(source_path), "-vf", build_transition_scale_filter(width, height)]
     use_hardware = sys.platform == "darwin"
     cmd += get_transition_variant_params(use_hardware)
 
     source_has_audio = probe_has_audio(ffprobe, source_path)
     if include_audio and source_has_audio:
-        audio_filter = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"
-        if fade_in and actual_fade > 0:
-            audio_filter += f",afade=t=in:st=0:d={actual_fade:.3f}"
-        if fade_out and actual_fade > 0:
-            fade_start = max(0.0, source_duration - actual_fade)
-            audio_filter += f",afade=t=out:st={fade_start:.3f}:d={actual_fade:.3f}"
-        cmd += ["-af", audio_filter, "-c:a", "aac", "-b:a", "96k"]
+        cmd += [
+            "-af",
+            "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+        ]
     else:
         cmd += ["-an"]
-
     cmd += ["-movflags", "+faststart", str(output_path)]
-    code, out, err = run_command(cmd)
-    if code == 0:
-        return True, out + err
+
+    fallback_cmd = None
     if use_hardware:
-        fallback_cmd = [ffmpeg, "-y", "-i", str(source_path), "-vf", ",".join(video_filters)] + get_transition_variant_params(False)
+        fallback_cmd = [ffmpeg, "-y", "-i", str(source_path), "-vf", build_transition_scale_filter(width, height)]
+        fallback_cmd += get_transition_variant_params(False)
         if include_audio and source_has_audio:
-            audio_filter = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"
-            if fade_in and actual_fade > 0:
-                audio_filter += f",afade=t=in:st=0:d={actual_fade:.3f}"
-            if fade_out and actual_fade > 0:
-                fade_start = max(0.0, source_duration - actual_fade)
-                audio_filter += f",afade=t=out:st={fade_start:.3f}:d={actual_fade:.3f}"
-            fallback_cmd += ["-af", audio_filter, "-c:a", "aac", "-b:a", "96k"]
+            fallback_cmd += [
+                "-af",
+                "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+            ]
         else:
             fallback_cmd += ["-an"]
         fallback_cmd += ["-movflags", "+faststart", str(output_path)]
-        code, out2, err2 = run_command(fallback_cmd)
-        return code == 0, out + err + out2 + err2
-    return False, out + err
+
+    return run_ffmpeg_with_hw_fallback(cmd, fallback_cmd)
+
+
+def copy_segment_from_standard(ffmpeg, source_path, output_path, start_time, duration):
+    if duration <= 0.02:
+        return True, ""
+    cmd = [ffmpeg, "-y"]
+    if start_time > 0:
+        cmd += ["-ss", f"{start_time:.3f}"]
+    cmd += ["-i", str(source_path), "-t", f"{duration:.3f}", "-c", "copy", "-movflags", "+faststart", "-avoid_negative_ts", "make_zero", str(output_path)]
+    code, out, err = run_command(cmd)
+    return code == 0, out + err
+
+
+def render_faded_segment(ffmpeg, standard_source_path, output_path, start_time, duration, fade_in, fade_out, include_audio):
+    if duration <= 0.02:
+        return True, ""
+    cmd = [ffmpeg, "-y"]
+    if start_time > 0:
+        cmd += ["-ss", f"{start_time:.3f}"]
+    cmd += ["-i", str(standard_source_path), "-t", f"{duration:.3f}"]
+
+    video_filter = []
+    if fade_in:
+        video_filter.append(f"fade=t=in:st=0:d={duration:.3f}:color=black")
+    if fade_out:
+        video_filter.append(f"fade=t=out:st=0:d={duration:.3f}:color=black")
+    if video_filter:
+        cmd += ["-vf", ",".join(video_filter)]
+
+    use_hardware = sys.platform == "darwin"
+    cmd += get_transition_variant_params(use_hardware)
+
+    if include_audio:
+        audio_filter = ["aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"]
+        if fade_in:
+            audio_filter.append(f"afade=t=in:st=0:d={duration:.3f}")
+        if fade_out:
+            audio_filter.append(f"afade=t=out:st=0:d={duration:.3f}")
+        cmd += ["-af", ",".join(audio_filter), "-c:a", "aac", "-b:a", "96k"]
+    else:
+        cmd += ["-an"]
+    cmd += ["-movflags", "+faststart", str(output_path)]
+
+    fallback_cmd = None
+    if use_hardware:
+        fallback_cmd = [ffmpeg, "-y"]
+        if start_time > 0:
+            fallback_cmd += ["-ss", f"{start_time:.3f}"]
+        fallback_cmd += ["-i", str(standard_source_path), "-t", f"{duration:.3f}"]
+        if video_filter:
+            fallback_cmd += ["-vf", ",".join(video_filter)]
+        fallback_cmd += get_transition_variant_params(False)
+        if include_audio:
+            fallback_cmd += ["-af", ",".join(audio_filter), "-c:a", "aac", "-b:a", "96k"]
+        else:
+            fallback_cmd += ["-an"]
+        fallback_cmd += ["-movflags", "+faststart", str(output_path)]
+
+    return run_ffmpeg_with_hw_fallback(cmd, fallback_cmd)
 
 
 def render_transition_gap(ffmpeg, output_path, target_resolution, gap_duration, include_audio):
@@ -300,15 +362,8 @@ def render_transition_gap(ffmpeg, output_path, target_resolution, gap_duration, 
         return cmd
 
     use_hardware = sys.platform == "darwin"
-    cmd = build_gap_cmd(use_hardware)
-    code, out, err = run_command(cmd)
-    if code == 0:
-        return True, out + err
-    if use_hardware:
-        fallback_cmd = build_gap_cmd(False)
-        code, out2, err2 = run_command(fallback_cmd)
-        return code == 0, out + err + out2 + err2
-    return False, out + err
+    fallback_cmd = build_gap_cmd(False) if use_hardware else None
+    return run_ffmpeg_with_hw_fallback(build_gap_cmd(use_hardware), fallback_cmd)
 
 
 def prepare_transition_assets(ffmpeg, ffprobe, video_paths, target_resolution, transition_profile, light_transition_seconds, cache_dir, cache, inflight, cache_lock):
@@ -316,7 +371,13 @@ def prepare_transition_assets(ffmpeg, ffprobe, video_paths, target_resolution, t
     profile = get_transition_profile(transition_profile, light_transition_seconds)
     fade_duration = profile["fade_duration"]
     gap_duration = profile["gap_duration"]
+    durations = [probe_duration(ffprobe, video_path) or 0.0 for video_path in video_paths]
     prepared_paths = []
+
+    def signal_inflight_done(key):
+        event = inflight.pop(key, None)
+        if event:
+            event.set()
 
     def wait_for_existing_job(key):
         with cache_lock:
@@ -330,16 +391,15 @@ def prepare_transition_assets(ffmpeg, ffprobe, video_paths, target_resolution, t
             return Path(cached_path), True, ""
         return None
 
-    def get_or_create_variant(source_path, fade_in, fade_out):
-        key = (str(source_path), target_resolution, transition_profile, light_transition_seconds, include_audio, fade_in, fade_out)
+    def get_or_create_standard(source_path):
+        key = ("standard", str(source_path), target_resolution, include_audio)
         with cache_lock:
             cached_path = cache.get(key)
             if cached_path and Path(cached_path).exists():
                 return Path(cached_path), True, ""
             existing_event = inflight.get(key)
             if existing_event is None:
-                existing_event = threading.Event()
-                inflight[key] = existing_event
+                inflight[key] = threading.Event()
                 owner = True
             else:
                 owner = False
@@ -347,36 +407,100 @@ def prepare_transition_assets(ffmpeg, ffprobe, video_paths, target_resolution, t
             waited = wait_for_existing_job(key)
             if waited:
                 return waited
-            return Path(cache_dir) / f"variant_{abs(hash(key))}.mp4", False, "转场缓存生成失败"
+            return Path(cache_dir) / f"standard_{abs(hash(key))}.mp4", False, "标准化缓存生成失败"
 
-        output_path = Path(cache_dir) / f"variant_{abs(hash(key))}.mp4"
-        ok, logtxt = render_transition_variant(
-            ffmpeg,
-            ffprobe,
-            source_path,
-            output_path,
-            target_resolution,
-            fade_in,
-            fade_out,
-            fade_duration,
-            include_audio,
-        )
+        output_path = Path(cache_dir) / f"standard_{abs(hash(key))}.mp4"
+        ok, logtxt = render_standard_clip(ffmpeg, ffprobe, source_path, output_path, target_resolution, include_audio)
         with cache_lock:
             if ok:
                 cache[key] = str(output_path)
-            inflight.pop(key, None).set()
+            signal_inflight_done(key)
         return output_path, ok, logtxt
 
-    def get_or_create_gap():
-        key = ("gap", target_resolution, transition_profile, light_transition_seconds, include_audio)
+    def get_or_create_body_segment(standard_path, kind, source_duration):
+        if kind == "front_body":
+            start_time = 0.0
+            duration = source_duration - fade_duration
+        elif kind == "middle_body":
+            start_time = fade_duration
+            duration = source_duration - (fade_duration * 2)
+        else:
+            start_time = fade_duration
+            duration = source_duration - fade_duration
+
+        if duration <= 0.02:
+            return None, True, ""
+
+        key = ("body", str(standard_path), kind, round(start_time, 3), round(duration, 3))
         with cache_lock:
             cached_path = cache.get(key)
             if cached_path and Path(cached_path).exists():
                 return Path(cached_path), True, ""
             existing_event = inflight.get(key)
             if existing_event is None:
-                existing_event = threading.Event()
-                inflight[key] = existing_event
+                inflight[key] = threading.Event()
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            waited = wait_for_existing_job(key)
+            if waited:
+                return waited
+            return Path(cache_dir) / f"body_{abs(hash(key))}.mp4", False, "主体片段缓存生成失败"
+
+        output_path = Path(cache_dir) / f"body_{abs(hash(key))}.mp4"
+        ok, logtxt = copy_segment_from_standard(ffmpeg, standard_path, output_path, start_time, duration)
+        with cache_lock:
+            if ok:
+                cache[key] = str(output_path)
+            signal_inflight_done(key)
+        return output_path, ok, logtxt
+
+    def get_or_create_fade_segment(standard_path, kind, source_duration):
+        start_time = 0.0 if kind == "head_fade" else max(0.0, source_duration - fade_duration)
+        key = ("fade", str(standard_path), kind, round(start_time, 3), round(fade_duration, 3), include_audio)
+        with cache_lock:
+            cached_path = cache.get(key)
+            if cached_path and Path(cached_path).exists():
+                return Path(cached_path), True, ""
+            existing_event = inflight.get(key)
+            if existing_event is None:
+                inflight[key] = threading.Event()
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            waited = wait_for_existing_job(key)
+            if waited:
+                return waited
+            return Path(cache_dir) / f"fade_{abs(hash(key))}.mp4", False, "转场片段缓存生成失败"
+
+        output_path = Path(cache_dir) / f"fade_{abs(hash(key))}.mp4"
+        ok, logtxt = render_faded_segment(
+            ffmpeg,
+            standard_path,
+            output_path,
+            start_time,
+            fade_duration,
+            kind == "head_fade",
+            kind == "tail_fade",
+            include_audio,
+        )
+        with cache_lock:
+            if ok:
+                cache[key] = str(output_path)
+            signal_inflight_done(key)
+        return output_path, ok, logtxt
+
+    def get_or_create_gap():
+        key = ("gap", target_resolution, round(gap_duration, 3), include_audio)
+        with cache_lock:
+            cached_path = cache.get(key)
+            if cached_path and Path(cached_path).exists():
+                return Path(cached_path), True, ""
+            existing_event = inflight.get(key)
+            if existing_event is None:
+                inflight[key] = threading.Event()
                 owner = True
             else:
                 owner = False
@@ -391,16 +515,50 @@ def prepare_transition_assets(ffmpeg, ffprobe, video_paths, target_resolution, t
         with cache_lock:
             if ok:
                 cache[key] = str(output_path)
-            inflight.pop(key, None).set()
+            signal_inflight_done(key)
         return output_path, ok, logtxt
 
     for index, video_path in enumerate(video_paths):
-        fade_in = index > 0
-        fade_out = index < len(video_paths) - 1
-        prepared_path, ok, logtxt = get_or_create_variant(video_path, fade_in, fade_out)
+        source_duration = durations[index]
+        standard_path, ok, logtxt = get_or_create_standard(video_path)
         if not ok:
             return False, logtxt, []
-        prepared_paths.append(prepared_path)
+
+        if index == 0:
+            body_path, ok, logtxt = get_or_create_body_segment(standard_path, "front_body", source_duration)
+            if not ok:
+                return False, logtxt, []
+            if body_path:
+                prepared_paths.append(body_path)
+            fade_path, ok, logtxt = get_or_create_fade_segment(standard_path, "tail_fade", source_duration)
+            if not ok:
+                return False, logtxt, []
+            prepared_paths.append(fade_path)
+        elif index == len(video_paths) - 1:
+            fade_path, ok, logtxt = get_or_create_fade_segment(standard_path, "head_fade", source_duration)
+            if not ok:
+                return False, logtxt, []
+            prepared_paths.append(fade_path)
+            body_path, ok, logtxt = get_or_create_body_segment(standard_path, "back_body", source_duration)
+            if not ok:
+                return False, logtxt, []
+            if body_path:
+                prepared_paths.append(body_path)
+        else:
+            head_path, ok, logtxt = get_or_create_fade_segment(standard_path, "head_fade", source_duration)
+            if not ok:
+                return False, logtxt, []
+            prepared_paths.append(head_path)
+            body_path, ok, logtxt = get_or_create_body_segment(standard_path, "middle_body", source_duration)
+            if not ok:
+                return False, logtxt, []
+            if body_path:
+                prepared_paths.append(body_path)
+            tail_path, ok, logtxt = get_or_create_fade_segment(standard_path, "tail_fade", source_duration)
+            if not ok:
+                return False, logtxt, []
+            prepared_paths.append(tail_path)
+
         if gap_duration > 0 and index < len(video_paths) - 1:
             gap_path, ok, logtxt = get_or_create_gap()
             if not ok:
@@ -678,6 +836,7 @@ class App:
         self.random_dir = StringVar()
         self.output_dir = StringVar()
         self.random_pick_count = IntVar(value=2)
+        self.random_order_mode = StringVar(value=RANDOM_ORDER_DISTINCT)
         self.transition_enabled = BooleanVar(value=False)
         self.transition_profile = StringVar(value="轻量")
         self.light_transition_seconds = StringVar(value=DEFAULT_LIGHT_TRANSITION_SECONDS)
@@ -762,6 +921,12 @@ class App:
         self.path_tabs = ttk.Notebook(path_section)
         self.path_tabs.grid(row=1, column=0, sticky="ew")
         self.path_tabs.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+        self.path_tabs.bind("<MouseWheel>", self.on_notebook_mousewheel)
+        self.path_tabs.bind("<Button-4>", self.on_notebook_mousewheel_linux)
+        self.path_tabs.bind("<Button-5>", self.on_notebook_mousewheel_linux)
+        self.root.bind_class("TNotebook", "<MouseWheel>", self.on_notebook_mousewheel)
+        self.root.bind_class("TNotebook", "<Button-4>", self.on_notebook_mousewheel_linux)
+        self.root.bind_class("TNotebook", "<Button-5>", self.on_notebook_mousewheel_linux)
 
         structured_tab = tk.Frame(self.path_tabs, bg=bg_color, padx=10, pady=10)
         structured_tab.grid_columnconfigure(0, weight=1)
@@ -796,6 +961,15 @@ class App:
         self.random_pick_info_var = StringVar(value="当前拼接数量：2 段")
         tk.Label(random_pick_row, textvariable=self.random_pick_info_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
 
+        random_order_row = tk.Frame(random_tab, bg=bg_color)
+        random_order_row.grid(row=2, column=0, sticky="ew", pady=4)
+        random_order_row.grid_columnconfigure(1, weight=1)
+        tk.Label(random_order_row, text="拼接顺序", font=font_normal, bg=bg_color, fg=fg_color, width=12, anchor="w").grid(row=0, column=0, sticky="w")
+        random_order_menu = tk.OptionMenu(random_order_row, self.random_order_mode, RANDOM_ORDER_DISTINCT, RANDOM_ORDER_IGNORE)
+        random_order_menu.config(width=18, font=font_normal, bg="white", fg=fg_color, highlightthickness=0)
+        random_order_menu["menu"].config(bg="white", fg=fg_color, font=font_normal)
+        random_order_menu.grid(row=0, column=1, sticky="w", padx=(10, 0))
+
         shared_path_content = tk.Frame(path_section, bg=bg_color)
         shared_path_content.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         shared_path_content.grid_columnconfigure(0, weight=1)
@@ -808,6 +982,7 @@ class App:
         self.back_dir.trace_add("write", lambda *args: self.update_counts())
         self.random_dir.trace_add("write", lambda *args: self.update_counts())
         self.random_pick_count.trace_add("write", lambda *args: self.update_counts())
+        self.random_order_mode.trace_add("write", lambda *args: self.update_counts())
         self.update_counts()
 
         options_section = tk.Frame(container, bg=bg_color)
@@ -981,17 +1156,27 @@ class App:
         else:
             delta = -1 * int(event.delta / 120)
         self.scroll_canvas.yview_scroll(delta, "units")
+        return "break"
 
     def on_mousewheel_linux(self, event):
         if event.num == 4:
             self.scroll_canvas.yview_scroll(-1, "units")
         elif event.num == 5:
             self.scroll_canvas.yview_scroll(1, "units")
+        return "break"
 
     def on_tab_changed(self, event=None):
         current_index = self.path_tabs.index(self.path_tabs.select())
         self.tab_mode.set("structured" if current_index == 0 else "random")
         self.update_counts()
+
+    def on_notebook_mousewheel(self, event):
+        self.on_mousewheel(event)
+        return "break"
+
+    def on_notebook_mousewheel_linux(self, event):
+        self.on_mousewheel_linux(event)
+        return "break"
 
     def build_path_row(self, parent, label, var, command):
         row = parent.grid_size()[1]
@@ -1115,9 +1300,11 @@ class App:
     def update_progress(self):
         self.queue.put(("progress", self.completed_tasks, self.total_tasks))
 
-    def count_random_outputs(self, video_count, pick_count):
+    def count_random_outputs(self, video_count, pick_count, order_mode):
         if video_count < pick_count:
             return 0
+        if order_mode == RANDOM_ORDER_IGNORE:
+            return math.comb(video_count, pick_count)
         return math.perm(video_count, pick_count)
 
     def build_output_name(self, video_paths):
@@ -1177,8 +1364,9 @@ class App:
             config.update({
                 "random_videos": random_videos,
                 "pick_count": pick_count,
+                "random_order_mode": self.random_order_mode.get(),
             })
-            self.total_tasks = self.count_random_outputs(len(random_videos), pick_count)
+            self.total_tasks = self.count_random_outputs(len(random_videos), pick_count, self.random_order_mode.get())
 
         ffmpeg = find_binary("ffmpeg")
         ffprobe = find_binary("ffprobe")
@@ -1315,7 +1503,9 @@ class App:
         else:
             random_videos = config["random_videos"]
             pick_count = config["pick_count"]
-            for video_paths in itertools.permutations(random_videos, pick_count):
+            random_order_mode = config.get("random_order_mode", RANDOM_ORDER_DISTINCT)
+            random_iterator = itertools.combinations(random_videos, pick_count) if random_order_mode == RANDOM_ORDER_IGNORE else itertools.permutations(random_videos, pick_count)
+            for video_paths in random_iterator:
                 output_name = self.build_output_name(video_paths)
                 output_path = output_dir / output_name
                 if skip_existing and output_path.exists():
@@ -1546,6 +1736,7 @@ class App:
             back_count = len(list_videos(self.back_dir.get())) if self.back_dir.get() else 0
             random_count = len(list_videos(self.random_dir.get())) if self.random_dir.get() else 0
             pick_count = int(self.random_pick_count.get() or 2)
+            random_order_mode = self.random_order_mode.get()
 
             self.front_count_var.set(f"共 {front_count} 个视频")
             self.middle_count_var.set(f"共 {middle_count} 个视频")
@@ -1556,7 +1747,7 @@ class App:
             if self.tab_mode.get() == "structured":
                 total = front_count * back_count if middle_count == 0 else front_count * middle_count * back_count
             else:
-                total = self.count_random_outputs(random_count, pick_count)
+                total = self.count_random_outputs(random_count, pick_count, random_order_mode)
             self.estimated_var.set(f"预计输出数量：{total}")
         except Exception:
             pass
