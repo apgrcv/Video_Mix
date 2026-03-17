@@ -20,6 +20,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v"}
 APP_VERSION = "2026-03-10-fast-transition"
 RANDOM_ORDER_DISTINCT = "顺序不同算不同结果"
 RANDOM_ORDER_IGNORE = "顺序不同算同一结果"
+SETTINGS_FILE = ".video_mix_settings.json"
 
 TRANSITION_PROFILES = {
     "极速": {"fade_duration": 0.08, "gap_duration": 0.0},
@@ -852,8 +853,11 @@ class App:
         self.last_eta_emit = {}
         self.log_panels = []
         self.thread_slots = None
+        self.settings_path = Path(__file__).resolve().parent / SETTINGS_FILE
+        self.directory_memory = self.load_directory_memory()
 
         self.build_ui()
+        self.restore_directory_state()
         self.root.after(100, self.process_queue)
 
     def build_ui(self):
@@ -983,6 +987,11 @@ class App:
         self.random_dir.trace_add("write", lambda *args: self.update_counts())
         self.random_pick_count.trace_add("write", lambda *args: self.update_counts())
         self.random_order_mode.trace_add("write", lambda *args: self.update_counts())
+        self.front_dir.trace_add("write", lambda *args: self.handle_directory_var_change("front_dir", self.front_dir))
+        self.middle_dir.trace_add("write", lambda *args: self.handle_directory_var_change("middle_dir", self.middle_dir))
+        self.back_dir.trace_add("write", lambda *args: self.handle_directory_var_change("back_dir", self.back_dir))
+        self.random_dir.trace_add("write", lambda *args: self.handle_directory_var_change("random_dir", self.random_dir))
+        self.output_dir.trace_add("write", lambda *args: self.handle_directory_var_change("output_dir", self.output_dir))
         self.update_counts()
 
         options_section = tk.Frame(container, bg=bg_color)
@@ -1241,34 +1250,86 @@ class App:
             self.light_duration_menu.configure(state="disabled")
         self.transition_hint_label.configure(fg="#666666" if enabled else "#b0b0b0")
 
-    def pick_front(self):
-        path = filedialog.askdirectory()
+    def load_directory_memory(self):
+        if not self.settings_path.exists():
+            return {}
+        try:
+            data = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_directory_memory(self):
+        try:
+            self.settings_path.write_text(
+                json.dumps(self.directory_memory, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def restore_directory_state(self):
+        for field_name, target_var in (
+            ("front_dir", self.front_dir),
+            ("middle_dir", self.middle_dir),
+            ("back_dir", self.back_dir),
+            ("random_dir", self.random_dir),
+            ("output_dir", self.output_dir),
+        ):
+            remembered = self.directory_memory.get(field_name)
+            if remembered and Path(remembered).is_dir():
+                target_var.set(remembered)
+
+    def remember_directory(self, field_name, directory):
+        if not directory:
+            return
+        directory_path = Path(directory)
+        if not directory_path.is_dir():
+            return
+        directory_str = str(directory_path)
+        self.directory_memory[field_name] = directory_str
+        self.directory_memory["last_browsed_dir"] = directory_str
+        self.save_directory_memory()
+
+    def handle_directory_var_change(self, field_name, target_var):
+        current_value = target_var.get().strip()
+        if current_value:
+            self.remember_directory(field_name, current_value)
+
+    def get_initial_browse_dir(self, field_name, target_var):
+        current_value = target_var.get().strip()
+        if current_value and Path(current_value).is_dir():
+            return current_value
+        remembered = self.directory_memory.get(field_name)
+        if remembered and Path(remembered).is_dir():
+            return remembered
+        last_browsed = self.directory_memory.get("last_browsed_dir")
+        if last_browsed and Path(last_browsed).is_dir():
+            return last_browsed
+        return str(Path(__file__).resolve().parent)
+
+    def browse_directory(self, field_name, target_var):
+        initial_dir = self.get_initial_browse_dir(field_name, target_var)
+        path = filedialog.askdirectory(initialdir=initial_dir)
         if path:
-            self.front_dir.set(path)
+            target_var.set(path)
+            self.remember_directory(field_name, path)
             self.update_counts()
+
+    def pick_front(self):
+        self.browse_directory("front_dir", self.front_dir)
 
     def pick_middle(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.middle_dir.set(path)
-            self.update_counts()
+        self.browse_directory("middle_dir", self.middle_dir)
 
     def pick_back(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.back_dir.set(path)
-            self.update_counts()
+        self.browse_directory("back_dir", self.back_dir)
 
     def pick_random_dir(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.random_dir.set(path)
-            self.update_counts()
+        self.browse_directory("random_dir", self.random_dir)
 
     def pick_output(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.output_dir.set(path)
+        self.browse_directory("output_dir", self.output_dir)
 
     def open_output(self):
         out_dir = self.output_dir.get()

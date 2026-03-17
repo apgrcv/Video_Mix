@@ -20,6 +20,7 @@ bin/
 # Logs
 *.log
 run.log
+.video_mix_settings.json
 
 # macOS
 .DS_Store
