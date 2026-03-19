@@ -12,6 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import Tk, StringVar, BooleanVar, IntVar, filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
@@ -27,6 +28,8 @@ TRANSITION_PROFILES = {
 }
 LIGHT_TRANSITION_OPTIONS = ["0.4", "0.6", "0.8", "1.0"]
 DEFAULT_LIGHT_TRANSITION_SECONDS = "0.6"
+WATERMARK_MODE_IMAGE = "图片水印"
+WATERMARK_MODE_TEXT = "文字水印"
 
 
 def list_videos(directory):
@@ -130,6 +133,64 @@ def probe_duration(ffprobe, video_path):
         return float(out.strip())
     except Exception:
         return None
+
+
+def merge_intervals(intervals):
+    if not intervals:
+        return []
+    sorted_intervals = sorted(intervals, key=lambda item: item[0])
+    merged = [sorted_intervals[0]]
+    for start_time, end_time in sorted_intervals[1:]:
+        last_start, last_end = merged[-1]
+        if start_time <= last_end:
+            merged[-1] = (last_start, max(last_end, end_time))
+        else:
+            merged.append((start_time, end_time))
+    return merged
+
+
+def build_enable_expression(intervals):
+    if not intervals:
+        return None
+    return "+".join(f"between(t,{start_time:.3f},{end_time:.3f})" for start_time, end_time in intervals)
+
+
+def escape_filter_value(value):
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace(",", "\\,")
+    )
+
+
+def find_drawtext_font():
+    candidates = []
+    if sys.platform == "darwin":
+        candidates = [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial Unicode.ttf",
+        ]
+    elif os.name == "nt":
+        candidates = [
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/msyh.ttf",
+            "C:/Windows/Fonts/simhei.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+    else:
+        candidates = [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return candidate
+    return None
 
 
 def probe_stream_signature(ffprobe, video_path):
@@ -821,6 +882,281 @@ def concat_reencode_four(ffmpeg, ffprobe, first, second, third, fourth, output, 
     )
 
 
+def build_watermark_intervals(duration, explicit_enabled, explicit_ranges, tail_enabled, tail_seconds):
+    intervals = []
+    if explicit_enabled:
+        intervals.extend(explicit_ranges)
+    if tail_enabled and tail_seconds > 0:
+        start_time = max(0.0, duration - tail_seconds)
+        intervals.append((start_time, duration))
+    merged = merge_intervals(intervals)
+    cleaned = []
+    for start_time, end_time in merged:
+        start_time = max(0.0, min(start_time, duration))
+        end_time = max(0.0, min(end_time, duration))
+        if end_time > start_time:
+            cleaned.append((start_time, end_time))
+    return cleaned
+
+
+def get_watermark_video_params(use_hardware):
+    if use_hardware:
+        return ["-c:v", "h264_videotoolbox", "-b:v", "5000k", "-allow_sw", "1"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+
+
+def run_ffmpeg_progress_command(cmd, progress_total=None, on_progress=None, on_proc=None):
+    try:
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace",
+            startupinfo=startupinfo,
+        )
+        if on_proc:
+            on_proc(proc)
+    except Exception as error:
+        return False, str(error)
+
+    out_lines = []
+    try:
+        while True:
+            line = proc.stdout.readline()
+            if line:
+                stripped = line.strip()
+                if stripped.startswith("out_time_ms="):
+                    try:
+                        milliseconds = int(stripped.split("=", 1)[1])
+                        seconds = milliseconds / 1000000.0
+                        if progress_total and on_progress:
+                            remaining = max(0.0, progress_total - seconds)
+                            on_progress(remaining)
+                    except Exception:
+                        pass
+                else:
+                    out_lines.append(stripped)
+                continue
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        code = proc.wait()
+    except Exception as error:
+        out_lines.append(str(error))
+        code = proc.returncode
+    return code == 0, "\n".join(out_lines)
+
+
+def build_watermark_image_filter(scale_percent, opacity_percent, x_pos, y_pos, enable_expr):
+    scale_ratio = max(0.01, scale_percent / 100.0)
+    opacity_ratio = max(0.0, min(1.0, opacity_percent / 100.0))
+    overlay_args = [str(int(x_pos)), str(int(y_pos))]
+    if enable_expr:
+        overlay_args.append(f"enable='{enable_expr}'")
+    overlay_filter = ":".join(overlay_args)
+    return (
+        f"[1:v]format=rgba,colorchannelmixer=aa={opacity_ratio:.3f}[wmraw];"
+        f"[wmraw][0:v]scale2ref=w=main_w*{scale_ratio:.4f}:h=ow/mdar[wm][base];"
+        f"[base][wm]overlay={overlay_filter}[v]"
+    )
+
+
+def apply_image_watermark(
+    ffmpeg,
+    ffprobe,
+    input_video,
+    output_video,
+    watermark_image,
+    scale_percent,
+    opacity_percent,
+    x_pos,
+    y_pos,
+    intervals,
+    progress_total=None,
+    on_progress=None,
+    on_proc=None,
+):
+    enable_expr = build_enable_expression(intervals)
+    filter_complex = build_watermark_image_filter(scale_percent, opacity_percent, x_pos, y_pos, enable_expr)
+    use_hardware = sys.platform == "darwin"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_video),
+        "-i",
+        str(watermark_image),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[v]",
+        "-map",
+        "0:a?",
+    ] + get_watermark_video_params(use_hardware) + [
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_video),
+        "-progress",
+        "pipe:1",
+        "-nostats",
+    ]
+    success, output_text = run_ffmpeg_progress_command(
+        cmd,
+        progress_total=progress_total or probe_duration(ffprobe, input_video) or 0.0,
+        on_progress=on_progress,
+        on_proc=on_proc,
+    )
+    if success:
+        return True, output_text
+    if use_hardware:
+        fallback_cmd = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(input_video),
+            "-i",
+            str(watermark_image),
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[v]",
+            "-map",
+            "0:a?",
+        ] + get_watermark_video_params(False) + [
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_video),
+            "-progress",
+            "pipe:1",
+            "-nostats",
+        ]
+        fallback_success, fallback_output = run_ffmpeg_progress_command(
+            fallback_cmd,
+            progress_total=progress_total or probe_duration(ffprobe, input_video) or 0.0,
+            on_progress=on_progress,
+            on_proc=on_proc,
+        )
+        return fallback_success, output_text + "\n" + fallback_output
+    return False, output_text
+
+
+def apply_text_watermark(
+    ffmpeg,
+    ffprobe,
+    input_video,
+    output_video,
+    text_content,
+    font_size,
+    opacity_percent,
+    x_pos,
+    y_pos,
+    intervals,
+    progress_total=None,
+    on_progress=None,
+    on_proc=None,
+):
+    enable_expr = build_enable_expression(intervals)
+    opacity_ratio = max(0.0, min(1.0, opacity_percent / 100.0))
+    fontfile = find_drawtext_font()
+    text_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
+    try:
+        text_file.write(text_content)
+        text_file.close()
+        drawtext_parts = []
+        if fontfile:
+            drawtext_parts.append(f"fontfile='{escape_filter_value(fontfile)}'")
+        drawtext_parts.extend(
+            [
+                f"textfile='{escape_filter_value(text_file.name)}'",
+                f"fontsize={int(font_size)}",
+                f"fontcolor=white@{opacity_ratio:.3f}",
+                f"x={int(x_pos)}",
+                f"y={int(y_pos)}",
+                "line_spacing=8",
+                "box=0",
+            ]
+        )
+        if enable_expr:
+            drawtext_parts.append(f"enable='{enable_expr}'")
+        video_filter = "drawtext=" + ":".join(drawtext_parts)
+        use_hardware = sys.platform == "darwin"
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(input_video),
+            "-vf",
+            video_filter,
+            "-map",
+            "0:v",
+            "-map",
+            "0:a?",
+        ] + get_watermark_video_params(use_hardware) + [
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_video),
+            "-progress",
+            "pipe:1",
+            "-nostats",
+        ]
+        success, output_text = run_ffmpeg_progress_command(
+            cmd,
+            progress_total=progress_total or probe_duration(ffprobe, input_video) or 0.0,
+            on_progress=on_progress,
+            on_proc=on_proc,
+        )
+        if success:
+            return True, output_text
+        if use_hardware:
+            fallback_cmd = [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(input_video),
+                "-vf",
+                video_filter,
+                "-map",
+                "0:v",
+                "-map",
+                "0:a?",
+            ] + get_watermark_video_params(False) + [
+                "-c:a",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_video),
+                "-progress",
+                "pipe:1",
+                "-nostats",
+            ]
+            fallback_success, fallback_output = run_ffmpeg_progress_command(
+                fallback_cmd,
+                progress_total=progress_total or probe_duration(ffprobe, input_video) or 0.0,
+                on_progress=on_progress,
+                on_proc=on_proc,
+            )
+            return fallback_success, output_text + "\n" + fallback_output
+        return False, output_text
+    finally:
+        try:
+            os.unlink(text_file.name)
+        except OSError:
+            pass
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -835,12 +1171,28 @@ class App:
         self.middle_dir = StringVar()
         self.back_dir = StringVar()
         self.random_dir = StringVar()
+        self.watermark_dir = StringVar()
         self.output_dir = StringVar()
         self.random_pick_count = IntVar(value=2)
         self.random_order_mode = StringVar(value=RANDOM_ORDER_DISTINCT)
         self.transition_enabled = BooleanVar(value=False)
         self.transition_profile = StringVar(value="轻量")
         self.light_transition_seconds = StringVar(value=DEFAULT_LIGHT_TRANSITION_SECONDS)
+        self.watermark_mode = StringVar(value=WATERMARK_MODE_IMAGE)
+        self.watermark_image_path = StringVar()
+        self.watermark_image_size_percent = StringVar(value="20")
+        self.watermark_image_opacity = StringVar(value="60")
+        self.watermark_image_x = StringVar(value="50")
+        self.watermark_image_y = StringVar(value="50")
+        self.watermark_text_size = StringVar(value="48")
+        self.watermark_text_opacity = StringVar(value="60")
+        self.watermark_text_x = StringVar(value="50")
+        self.watermark_text_y = StringVar(value="50")
+        self.watermark_preview_width = StringVar(value="1080")
+        self.watermark_preview_height = StringVar(value="1920")
+        self.watermark_intervals_enabled = BooleanVar(value=False)
+        self.watermark_tail_enabled = BooleanVar(value=False)
+        self.watermark_tail_seconds = StringVar(value="3")
         self.mode = StringVar(value="优先无损（失败自动转兼容）")
         self.resolution_mode = StringVar(value="custom")
         self.custom_width = IntVar(value=1080)
@@ -855,6 +1207,8 @@ class App:
         self.thread_slots = None
         self.settings_path = Path(__file__).resolve().parent / SETTINGS_FILE
         self.directory_memory = self.load_directory_memory()
+        self.watermark_interval_rows = []
+        self.watermark_preview_photo = None
 
         self.build_ui()
         self.restore_directory_state()
@@ -940,6 +1294,10 @@ class App:
         random_tab.grid_columnconfigure(0, weight=1)
         self.path_tabs.add(random_tab, text="随机排列组合")
 
+        watermark_tab = tk.Frame(self.path_tabs, bg=bg_color, padx=10, pady=10)
+        watermark_tab.grid_columnconfigure(0, weight=1)
+        self.path_tabs.add(watermark_tab, text="加水印")
+
         front_row = self.build_path_row(structured_tab, "前半段目录", self.front_dir, self.pick_front)
         middle_row = self.build_path_row(structured_tab, "中段目录 (可选)", self.middle_dir, self.pick_middle)
         back_row = self.build_path_row(structured_tab, "后半段目录", self.back_dir, self.pick_back)
@@ -974,6 +1332,21 @@ class App:
         random_order_menu["menu"].config(bg="white", fg=fg_color, font=font_normal)
         random_order_menu.grid(row=0, column=1, sticky="w", padx=(10, 0))
 
+        watermark_dir_row = self.build_path_row(watermark_tab, "视频目录", self.watermark_dir, self.pick_watermark_dir)
+        self.watermark_dir_count_var = StringVar(value="共 0 个视频")
+        tk.Label(watermark_dir_row, textvariable=self.watermark_dir_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
+
+        watermark_help_row = tk.Frame(watermark_tab, bg=bg_color)
+        watermark_help_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        tk.Label(
+            watermark_help_row,
+            text="该功能会对当前目录内所有视频批量加水印，结果输出到下方的输出目录。",
+            font=font_small,
+            bg=bg_color,
+            fg="#666666",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
         shared_path_content = tk.Frame(path_section, bg=bg_color)
         shared_path_content.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         shared_path_content.grid_columnconfigure(0, weight=1)
@@ -987,10 +1360,12 @@ class App:
         self.random_dir.trace_add("write", lambda *args: self.update_counts())
         self.random_pick_count.trace_add("write", lambda *args: self.update_counts())
         self.random_order_mode.trace_add("write", lambda *args: self.update_counts())
+        self.watermark_dir.trace_add("write", lambda *args: self.update_counts())
         self.front_dir.trace_add("write", lambda *args: self.handle_directory_var_change("front_dir", self.front_dir))
         self.middle_dir.trace_add("write", lambda *args: self.handle_directory_var_change("middle_dir", self.middle_dir))
         self.back_dir.trace_add("write", lambda *args: self.handle_directory_var_change("back_dir", self.back_dir))
         self.random_dir.trace_add("write", lambda *args: self.handle_directory_var_change("random_dir", self.random_dir))
+        self.watermark_dir.trace_add("write", lambda *args: self.handle_directory_var_change("watermark_dir", self.watermark_dir))
         self.output_dir.trace_add("write", lambda *args: self.handle_directory_var_change("output_dir", self.output_dir))
         self.update_counts()
 
@@ -1001,6 +1376,7 @@ class App:
         options_frame = tk.Frame(options_section, bg=bg_color)
         options_frame.grid(row=1, column=0, sticky="ew")
         options_frame.grid_columnconfigure(0, weight=1)
+        self.merge_options_frame = options_frame
 
         row1 = tk.Frame(options_frame, bg=bg_color)
         row1.grid(row=0, column=0, sticky="ew", pady=4)
@@ -1105,6 +1481,148 @@ class App:
         self.light_transition_row = row5
         self.light_duration_menu = light_duration_menu
         self.transition_enabled.trace_add("write", lambda *args: self.refresh_transition_state())
+
+        watermark_options_frame = tk.Frame(options_section, bg=bg_color)
+        watermark_options_frame.grid(row=1, column=0, sticky="ew")
+        watermark_options_frame.grid_columnconfigure(0, weight=1)
+        self.watermark_options_frame = watermark_options_frame
+
+        watermark_type_row = tk.Frame(watermark_options_frame, bg=bg_color)
+        watermark_type_row.grid(row=0, column=0, sticky="ew", pady=4)
+        tk.Label(watermark_type_row, text="水印类型", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Radiobutton(
+            watermark_type_row,
+            text=WATERMARK_MODE_IMAGE,
+            variable=self.watermark_mode,
+            value=WATERMARK_MODE_IMAGE,
+            command=self.refresh_watermark_mode_state,
+            font=font_normal,
+            bg=bg_color,
+            fg=fg_color,
+            activebackground=bg_color,
+            activeforeground=fg_color,
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        tk.Radiobutton(
+            watermark_type_row,
+            text=WATERMARK_MODE_TEXT,
+            variable=self.watermark_mode,
+            value=WATERMARK_MODE_TEXT,
+            command=self.refresh_watermark_mode_state,
+            font=font_normal,
+            bg=bg_color,
+            fg=fg_color,
+            activebackground=bg_color,
+            activeforeground=fg_color,
+        ).grid(row=0, column=2, sticky="w", padx=(10, 0))
+
+        image_frame = tk.Frame(watermark_options_frame, bg=bg_color)
+        image_frame.grid(row=1, column=0, sticky="ew", pady=4)
+        image_frame.grid_columnconfigure(1, weight=1)
+        tk.Label(image_frame, text="PNG 水印", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Entry(image_frame, textvariable=self.watermark_image_path, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=1, sticky="ew", padx=(10, 10))
+        tk.Button(image_frame, text="选择图片", command=self.pick_watermark_image, font=self.font_normal, highlightbackground=bg_color).grid(row=0, column=2, sticky="e")
+        self.watermark_image_meta_var = StringVar(value="图片尺寸：未选择")
+        tk.Label(image_frame, textvariable=self.watermark_image_meta_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(4, 0))
+
+        image_param_row = tk.Frame(watermark_options_frame, bg=bg_color)
+        image_param_row.grid(row=2, column=0, sticky="ew", pady=4)
+        tk.Label(image_param_row, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        tk.Label(image_param_row, text="大小%", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        tk.Entry(image_param_row, textvariable=self.watermark_image_size_percent, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=2, sticky="w", padx=(4, 0))
+        tk.Label(image_param_row, text="透明度%", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=3, sticky="w", padx=(12, 0))
+        tk.Entry(image_param_row, textvariable=self.watermark_image_opacity, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=4, sticky="w", padx=(4, 0))
+        tk.Label(image_param_row, text="X", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=5, sticky="w", padx=(12, 0))
+        tk.Entry(image_param_row, textvariable=self.watermark_image_x, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=6, sticky="w", padx=(4, 0))
+        tk.Label(image_param_row, text="Y", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=7, sticky="w", padx=(12, 0))
+        tk.Entry(image_param_row, textvariable=self.watermark_image_y, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=8, sticky="w", padx=(4, 0))
+
+        text_frame = tk.Frame(watermark_options_frame, bg=bg_color)
+        text_frame.grid(row=3, column=0, sticky="ew", pady=4)
+        text_frame.grid_columnconfigure(1, weight=1)
+        tk.Label(text_frame, text="文字水印", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="nw").grid(row=0, column=0, sticky="nw")
+        self.watermark_text_widget = ScrolledText(text_frame, height=4, font=("Helvetica", 11), bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db")
+        self.watermark_text_widget.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+
+        text_param_row = tk.Frame(watermark_options_frame, bg=bg_color)
+        text_param_row.grid(row=4, column=0, sticky="ew", pady=4)
+        tk.Label(text_param_row, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        tk.Label(text_param_row, text="字号", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        tk.Entry(text_param_row, textvariable=self.watermark_text_size, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=2, sticky="w", padx=(4, 0))
+        tk.Label(text_param_row, text="透明度%", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=3, sticky="w", padx=(12, 0))
+        tk.Entry(text_param_row, textvariable=self.watermark_text_opacity, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=4, sticky="w", padx=(4, 0))
+        tk.Label(text_param_row, text="X", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=5, sticky="w", padx=(12, 0))
+        tk.Entry(text_param_row, textvariable=self.watermark_text_x, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=6, sticky="w", padx=(4, 0))
+        tk.Label(text_param_row, text="Y", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=7, sticky="w", padx=(12, 0))
+        tk.Entry(text_param_row, textvariable=self.watermark_text_y, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=8, sticky="w", padx=(4, 0))
+
+        preview_row = tk.Frame(watermark_options_frame, bg=bg_color)
+        preview_row.grid(row=5, column=0, sticky="ew", pady=4)
+        tk.Label(preview_row, text="预览尺寸", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(preview_row, text="宽", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        tk.Entry(preview_row, textvariable=self.watermark_preview_width, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=2, sticky="w", padx=(4, 0))
+        tk.Label(preview_row, text="高", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=3, sticky="w", padx=(10, 0))
+        tk.Entry(preview_row, textvariable=self.watermark_preview_height, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=4, sticky="w", padx=(4, 0))
+        tk.Button(preview_row, text="预览", command=self.render_watermark_preview, font=self.font_normal, highlightbackground=bg_color).grid(row=0, column=5, sticky="w", padx=(12, 0))
+
+        preview_canvas_row = tk.Frame(watermark_options_frame, bg=bg_color)
+        preview_canvas_row.grid(row=6, column=0, sticky="ew", pady=(4, 8))
+        tk.Label(preview_canvas_row, text="预览画布", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="nw").grid(row=0, column=0, sticky="nw")
+        self.watermark_preview_canvas = tk.Canvas(preview_canvas_row, width=360, height=240, bg="white", highlightthickness=1, highlightbackground="#d1d5db")
+        self.watermark_preview_canvas.grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        schedule_title_row = tk.Frame(watermark_options_frame, bg=bg_color)
+        schedule_title_row.grid(row=7, column=0, sticky="ew", pady=(8, 2))
+        tk.Label(schedule_title_row, text="出现时间配置", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=0, sticky="w")
+
+        explicit_toggle_row = tk.Frame(watermark_options_frame, bg=bg_color)
+        explicit_toggle_row.grid(row=8, column=0, sticky="ew", pady=4)
+        tk.Label(explicit_toggle_row, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        tk.Checkbutton(
+            explicit_toggle_row,
+            text="启用指定秒段",
+            variable=self.watermark_intervals_enabled,
+            command=self.refresh_watermark_schedule_state,
+            font=font_normal,
+            bg=bg_color,
+            fg=fg_color,
+            activebackground=bg_color,
+            activeforeground=fg_color,
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.watermark_add_interval_button = tk.Button(explicit_toggle_row, text="新增时间段", command=self.add_watermark_interval_row, font=self.font_normal, highlightbackground=bg_color)
+        self.watermark_add_interval_button.grid(row=0, column=2, sticky="w", padx=(12, 0))
+
+        self.watermark_intervals_frame = tk.Frame(watermark_options_frame, bg=bg_color)
+        self.watermark_intervals_frame.grid(row=9, column=0, sticky="ew", pady=(0, 4))
+
+        tail_row = tk.Frame(watermark_options_frame, bg=bg_color)
+        tail_row.grid(row=10, column=0, sticky="ew", pady=4)
+        tk.Label(tail_row, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        tk.Checkbutton(
+            tail_row,
+            text="启用结尾倒数秒",
+            variable=self.watermark_tail_enabled,
+            command=self.refresh_watermark_schedule_state,
+            font=font_normal,
+            bg=bg_color,
+            fg=fg_color,
+            activebackground=bg_color,
+            activeforeground=fg_color,
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        tk.Entry(tail_row, textvariable=self.watermark_tail_seconds, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=2, sticky="w", padx=(8, 0))
+        tk.Label(tail_row, text="秒", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=3, sticky="w", padx=(6, 0))
+
+        self.watermark_image_frame = image_frame
+        self.watermark_image_param_row = image_param_row
+        self.watermark_text_frame = text_frame
+        self.watermark_text_param_row = text_param_row
+        self.watermark_tail_row = tail_row
+        self.watermark_mode.trace_add("write", lambda *args: self.refresh_watermark_mode_state())
+        self.watermark_intervals_enabled.trace_add("write", lambda *args: self.refresh_watermark_schedule_state())
+        self.watermark_tail_enabled.trace_add("write", lambda *args: self.refresh_watermark_schedule_state())
+        self.add_watermark_interval_row()
+
+        self.watermark_options_frame.grid_remove()
+
         progress_section = tk.Frame(container, bg=bg_color)
         progress_section.grid(row=3, column=0, sticky="ew", pady=(0, 15))
         tk.Label(progress_section, text="任务进度", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=0, sticky="w", pady=(0, 8))
@@ -1122,7 +1640,7 @@ class App:
         buttons_frame.grid(row=4, column=0, sticky="ew", pady=(0, 15))
         buttons_frame.grid_columnconfigure(3, weight=1)
         btn_font = ("Helvetica", 12, "bold")
-        self.start_button = tk.Button(buttons_frame, text="开始合并", command=self.start_merge, font=btn_font, bg="#3b82f6", fg="black", activebackground="#2563eb", activeforeground="black", highlightbackground=bg_color)
+        self.start_button = tk.Button(buttons_frame, text="开始任务", command=self.start_merge, font=btn_font, bg="#3b82f6", fg="black", activebackground="#2563eb", activeforeground="black", highlightbackground=bg_color)
         self.stop_button = tk.Button(buttons_frame, text="停止任务", command=self.stop_merge, font=btn_font, state="disabled", highlightbackground=bg_color)
         self.open_button = tk.Button(buttons_frame, text="打开输出目录", command=self.open_output, font=btn_font, highlightbackground=bg_color)
         tk.Label(buttons_frame, text="并发数", font=font_small, bg=bg_color, fg="#666666").grid(row=0, column=3, sticky="e", padx=(10, 4))
@@ -1147,6 +1665,9 @@ class App:
 
         self.refresh_resolution_state()
         self.refresh_transition_state()
+        self.refresh_watermark_mode_state()
+        self.refresh_watermark_schedule_state()
+        self.on_tab_changed()
 
         if os.environ.get("VIDEO_MIX_DEBUG_UI") == "1":
             self.root.after(800, self.dump_ui_state)
@@ -1157,14 +1678,22 @@ class App:
     def on_scroll_canvas_configure(self, event):
         self.scroll_canvas.itemconfig(self.scroll_window, width=event.width)
 
-    def on_mousewheel(self, event):
-        if os.name == "nt":
-            delta = -1 * int(event.delta / 120)
-        elif sys.platform == "darwin":
-            delta = -1 * int(event.delta)
+    def _normalize_mousewheel_delta(self, delta):
+        if delta == 0:
+            return 0
+        direction = -1 if delta > 0 else 1
+        magnitude = abs(delta)
+        if sys.platform == "darwin":
+            # macOS often reports large wheel/trackpad deltas; clamp to small steps.
+            steps = max(1, min(4, int(magnitude / 40) or 1))
         else:
-            delta = -1 * int(event.delta / 120)
-        self.scroll_canvas.yview_scroll(delta, "units")
+            steps = max(1, int(magnitude / 120) or 1)
+        return direction * steps
+
+    def on_mousewheel(self, event):
+        delta = self._normalize_mousewheel_delta(event.delta)
+        if delta != 0:
+            self.scroll_canvas.yview_scroll(delta, "units")
         return "break"
 
     def on_mousewheel_linux(self, event):
@@ -1176,7 +1705,18 @@ class App:
 
     def on_tab_changed(self, event=None):
         current_index = self.path_tabs.index(self.path_tabs.select())
-        self.tab_mode.set("structured" if current_index == 0 else "random")
+        if current_index == 0:
+            self.tab_mode.set("structured")
+        elif current_index == 1:
+            self.tab_mode.set("random")
+        else:
+            self.tab_mode.set("watermark")
+        if self.tab_mode.get() == "watermark":
+            self.merge_options_frame.grid_remove()
+            self.watermark_options_frame.grid()
+        else:
+            self.watermark_options_frame.grid_remove()
+            self.merge_options_frame.grid()
         self.update_counts()
 
     def on_notebook_mousewheel(self, event):
@@ -1250,6 +1790,241 @@ class App:
             self.light_duration_menu.configure(state="disabled")
         self.transition_hint_label.configure(fg="#666666" if enabled else "#b0b0b0")
 
+    def refresh_watermark_mode_state(self):
+        image_mode = self.watermark_mode.get() == WATERMARK_MODE_IMAGE
+        if image_mode:
+            self.watermark_image_frame.grid()
+            self.watermark_image_param_row.grid()
+            self.watermark_text_frame.grid_remove()
+            self.watermark_text_param_row.grid_remove()
+        else:
+            self.watermark_image_frame.grid_remove()
+            self.watermark_image_param_row.grid_remove()
+            self.watermark_text_frame.grid()
+            self.watermark_text_param_row.grid()
+
+    def refresh_watermark_schedule_state(self):
+        interval_state = "normal" if self.watermark_intervals_enabled.get() else "disabled"
+        self.watermark_add_interval_button.configure(state=interval_state)
+        for row in self.watermark_interval_rows:
+            row["start_entry"].configure(state=interval_state)
+            row["end_entry"].configure(state=interval_state)
+            row["remove_button"].configure(state=interval_state)
+        tail_state = "normal" if self.watermark_tail_enabled.get() else "disabled"
+        if hasattr(self, "watermark_tail_row"):
+            for child in self.watermark_tail_row.winfo_children():
+                if isinstance(child, tk.Entry):
+                    child.configure(state=tail_state)
+
+    def add_watermark_interval_row(self, start_value="", end_value=""):
+        row_index = len(self.watermark_interval_rows)
+        row_frame = tk.Frame(self.watermark_intervals_frame, bg=self.ui_bg)
+        row_frame.grid(row=row_index, column=0, sticky="ew", pady=2)
+        tk.Label(row_frame, text="", font=self.font_normal, bg=self.ui_bg, width=10).grid(row=0, column=0, sticky="w")
+        tk.Label(row_frame, text="开始秒", font=self.font_normal, bg=self.ui_bg, fg=self.ui_fg).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        start_var = StringVar(value=start_value)
+        start_entry = tk.Entry(row_frame, textvariable=start_var, width=8, font=self.font_normal, bg="white", fg=self.ui_fg, highlightthickness=1, highlightbackground="#d1d5db")
+        start_entry.grid(row=0, column=2, sticky="w", padx=(4, 0))
+        tk.Label(row_frame, text="结束秒", font=self.font_normal, bg=self.ui_bg, fg=self.ui_fg).grid(row=0, column=3, sticky="w", padx=(10, 0))
+        end_var = StringVar(value=end_value)
+        end_entry = tk.Entry(row_frame, textvariable=end_var, width=8, font=self.font_normal, bg="white", fg=self.ui_fg, highlightthickness=1, highlightbackground="#d1d5db")
+        end_entry.grid(row=0, column=4, sticky="w", padx=(4, 0))
+        remove_button = tk.Button(row_frame, text="删除", command=lambda: self.remove_watermark_interval_row(row_frame), font=self.font_normal, highlightbackground=self.ui_bg)
+        remove_button.grid(row=0, column=5, sticky="w", padx=(12, 0))
+        self.watermark_interval_rows.append(
+            {
+                "frame": row_frame,
+                "start_var": start_var,
+                "end_var": end_var,
+                "start_entry": start_entry,
+                "end_entry": end_entry,
+                "remove_button": remove_button,
+            }
+        )
+        self.refresh_watermark_schedule_state()
+
+    def remove_watermark_interval_row(self, row_frame):
+        if len(self.watermark_interval_rows) <= 1:
+            for row in self.watermark_interval_rows:
+                if row["frame"] == row_frame:
+                    row["start_var"].set("")
+                    row["end_var"].set("")
+            return
+        self.watermark_interval_rows = [row for row in self.watermark_interval_rows if row["frame"] != row_frame]
+        row_frame.destroy()
+        for index, row in enumerate(self.watermark_interval_rows):
+            row["frame"].grid_configure(row=index)
+
+    def pick_watermark_dir(self):
+        self.browse_directory("watermark_dir", self.watermark_dir)
+
+    def pick_watermark_image(self):
+        initial_dir = self.directory_memory.get("last_browsed_dir", str(Path(__file__).resolve().parent))
+        current_path = self.watermark_image_path.get().strip()
+        if current_path and Path(current_path).exists():
+            initial_dir = str(Path(current_path).parent)
+        path = filedialog.askopenfilename(
+            initialdir=initial_dir,
+            filetypes=[("PNG 图片", "*.png")],
+        )
+        if path:
+            self.watermark_image_path.set(path)
+            self.directory_memory["last_browsed_dir"] = str(Path(path).parent)
+            self.save_directory_memory()
+            try:
+                image = tk.PhotoImage(file=path)
+                self.watermark_image_meta_var.set(f"图片尺寸：{image.width()} × {image.height()}")
+            except Exception:
+                self.watermark_image_meta_var.set("图片尺寸：读取失败")
+
+    def get_watermark_text_content(self):
+        return self.watermark_text_widget.get("1.0", "end").rstrip("\n")
+
+    def render_watermark_preview(self):
+        canvas = self.watermark_preview_canvas
+        canvas.delete("all")
+        canvas_width = int(canvas.cget("width"))
+        canvas_height = int(canvas.cget("height"))
+        try:
+            preview_width = max(1, int(float(self.watermark_preview_width.get())))
+            preview_height = max(1, int(float(self.watermark_preview_height.get())))
+        except Exception:
+            messagebox.showerror("错误", "预览宽高必须是有效数字")
+            return
+
+        scale = min((canvas_width - 20) / preview_width, (canvas_height - 20) / preview_height)
+        scale = max(scale, 0.1)
+        video_width = preview_width * scale
+        video_height = preview_height * scale
+        left = (canvas_width - video_width) / 2
+        top = (canvas_height - video_height) / 2
+        right = left + video_width
+        bottom = top + video_height
+
+        canvas.create_rectangle(left, top, right, bottom, outline="#3b82f6", width=2, fill="#f8fafc")
+        canvas.create_text(left + 8, top + 8, text=f"{preview_width}×{preview_height}", anchor="nw", fill="#64748b", font=("Helvetica", 9))
+
+        if self.watermark_mode.get() == WATERMARK_MODE_IMAGE:
+            image_path = self.watermark_image_path.get().strip()
+            if not image_path or not Path(image_path).exists():
+                canvas.create_text(canvas_width / 2, canvas_height / 2, text="请先选择 PNG 水印", fill="#999999", font=("Helvetica", 11))
+                return
+            try:
+                image = tk.PhotoImage(file=image_path)
+                image_width = image.width()
+                image_height = image.height()
+            except Exception:
+                canvas.create_text(canvas_width / 2, canvas_height / 2, text="PNG 读取失败", fill="#999999", font=("Helvetica", 11))
+                return
+            try:
+                scale_percent = max(1.0, float(self.watermark_image_size_percent.get()))
+                x_pos = float(self.watermark_image_x.get())
+                y_pos = float(self.watermark_image_y.get())
+            except Exception:
+                messagebox.showerror("错误", "图片水印的位置和大小必须是有效数字")
+                return
+            display_width = preview_width * (scale_percent / 100.0) * scale
+            display_height = display_width * (image_height / max(1, image_width))
+            wm_left = left + x_pos * scale
+            wm_top = top + y_pos * scale
+            wm_right = wm_left + display_width
+            wm_bottom = wm_top + display_height
+            canvas.create_rectangle(wm_left, wm_top, wm_right, wm_bottom, outline="#ef4444", width=2, fill="#fecaca")
+            canvas.create_text((wm_left + wm_right) / 2, (wm_top + wm_bottom) / 2, text="PNG", fill="#7f1d1d", font=("Helvetica", 10, "bold"))
+        else:
+            text_content = self.get_watermark_text_content()
+            if not text_content.strip():
+                canvas.create_text(canvas_width / 2, canvas_height / 2, text="请输入文字水印内容", fill="#999999", font=("Helvetica", 11))
+                return
+            try:
+                font_size = max(1, int(float(self.watermark_text_size.get())))
+                x_pos = float(self.watermark_text_x.get())
+                y_pos = float(self.watermark_text_y.get())
+            except Exception:
+                messagebox.showerror("错误", "文字水印的位置和字号必须是有效数字")
+                return
+            preview_font_size = max(8, int(font_size * scale))
+            preview_font = tkfont.Font(family="Helvetica", size=preview_font_size)
+            wm_left = left + x_pos * scale
+            wm_top = top + y_pos * scale
+            canvas.create_text(
+                wm_left,
+                wm_top,
+                text=text_content,
+                anchor="nw",
+                fill="#1d4ed8",
+                font=preview_font,
+            )
+
+    def parse_watermark_intervals(self):
+        parsed = []
+        if not self.watermark_intervals_enabled.get():
+            return parsed
+        for row in self.watermark_interval_rows:
+            start_value = row["start_var"].get().strip()
+            end_value = row["end_var"].get().strip()
+            if not start_value and not end_value:
+                continue
+            try:
+                start_time = float(start_value)
+                end_time = float(end_value)
+            except Exception:
+                raise ValueError("指定秒段中的开始秒和结束秒必须是数字")
+            if start_time < 0 or end_time < 0 or end_time <= start_time:
+                raise ValueError("指定秒段必须满足：开始秒 >= 0，结束秒 > 开始秒")
+            parsed.append((start_time, end_time))
+        if self.watermark_intervals_enabled.get() and not parsed:
+            raise ValueError("请至少填写一个有效的指定秒段")
+        return parsed
+
+    def get_watermark_config(self):
+        config = {
+            "mode": self.watermark_mode.get(),
+            "preview_size": (
+                int(float(self.watermark_preview_width.get())),
+                int(float(self.watermark_preview_height.get())),
+            ),
+            "explicit_enabled": self.watermark_intervals_enabled.get(),
+            "explicit_ranges": self.parse_watermark_intervals(),
+            "tail_enabled": self.watermark_tail_enabled.get(),
+            "tail_seconds": float(self.watermark_tail_seconds.get() or 0),
+        }
+        if config["tail_enabled"] and config["tail_seconds"] <= 0:
+            raise ValueError("结尾倒数秒数必须大于 0")
+
+        if config["mode"] == WATERMARK_MODE_IMAGE:
+            image_path = self.watermark_image_path.get().strip()
+            if not image_path or not Path(image_path).exists():
+                raise ValueError("请先选择 PNG 水印图片")
+            config.update(
+                {
+                    "image_path": image_path,
+                    "scale_percent": float(self.watermark_image_size_percent.get()),
+                    "opacity_percent": float(self.watermark_image_opacity.get()),
+                    "x_pos": float(self.watermark_image_x.get()),
+                    "y_pos": float(self.watermark_image_y.get()),
+                }
+            )
+        else:
+            text_content = self.get_watermark_text_content()
+            if not text_content.strip():
+                raise ValueError("请输入文字水印内容")
+            config.update(
+                {
+                    "text_content": text_content,
+                    "font_size": int(float(self.watermark_text_size.get())),
+                    "opacity_percent": float(self.watermark_text_opacity.get()),
+                    "x_pos": float(self.watermark_text_x.get()),
+                    "y_pos": float(self.watermark_text_y.get()),
+                }
+            )
+
+        if not (0 < config["opacity_percent"] <= 100):
+            raise ValueError("透明度必须在 1 到 100 之间")
+        if config["mode"] == WATERMARK_MODE_IMAGE and config["scale_percent"] <= 0:
+            raise ValueError("图片水印大小百分比必须大于 0")
+        return config
+
     def load_directory_memory(self):
         if not self.settings_path.exists():
             return {}
@@ -1274,6 +2049,7 @@ class App:
             ("middle_dir", self.middle_dir),
             ("back_dir", self.back_dir),
             ("random_dir", self.random_dir),
+            ("watermark_dir", self.watermark_dir),
             ("output_dir", self.output_dir),
         ):
             remembered = self.directory_memory.get(field_name)
@@ -1412,7 +2188,7 @@ class App:
                 "backs": backs,
             })
             self.total_tasks = len(fronts) * len(backs) if not middles else len(fronts) * len(middles) * len(backs)
-        else:
+        elif strategy == "random":
             random_dir = self.random_dir.get()
             if not random_dir:
                 messagebox.showerror("错误", "请先选择文件目录")
@@ -1428,6 +2204,25 @@ class App:
                 "random_order_mode": self.random_order_mode.get(),
             })
             self.total_tasks = self.count_random_outputs(len(random_videos), pick_count, self.random_order_mode.get())
+        else:
+            watermark_dir = self.watermark_dir.get()
+            if not watermark_dir:
+                messagebox.showerror("错误", "请先选择视频目录")
+                return
+            watermark_videos = list_videos(watermark_dir)
+            if not watermark_videos:
+                messagebox.showerror("错误", "视频目录中未找到可用的视频文件")
+                return
+            try:
+                watermark_config = self.get_watermark_config()
+            except ValueError as error:
+                messagebox.showerror("错误", str(error))
+                return
+            config.update({
+                "watermark_videos": watermark_videos,
+                "watermark_config": watermark_config,
+            })
+            self.total_tasks = len(watermark_videos)
 
         ffmpeg = find_binary("ffmpeg")
         ffprobe = find_binary("ffprobe")
@@ -1561,7 +2356,7 @@ class App:
                             self.update_progress()
                         else:
                             combinations.append((video_paths, output_name, output_path))
-        else:
+        elif strategy == "random":
             random_videos = config["random_videos"]
             pick_count = config["pick_count"]
             random_order_mode = config.get("random_order_mode", RANDOM_ORDER_DISTINCT)
@@ -1575,6 +2370,16 @@ class App:
                     self.update_progress()
                 else:
                     combinations.append((video_paths, output_name, output_path))
+        else:
+            for input_video in config["watermark_videos"]:
+                output_name = f"{input_video.stem}_watermark.mp4"
+                output_path = output_dir / output_name
+                if skip_existing and output_path.exists():
+                    self.log(f"跳过已存在：{output_name}")
+                    self.completed_tasks += 1
+                    self.update_progress()
+                else:
+                    combinations.append(((input_video,), output_name, output_path))
 
         if not combinations:
             self.finish()
@@ -1601,6 +2406,67 @@ class App:
                 on_proc = lambda proc: self.register_proc(proc, output_path)
                 video_list = list(video_paths)
                 clip_durations = [probe_duration(ffprobe, video_path) or 0.0 for video_path in video_list]
+
+                if strategy == "watermark":
+                    watermark_config = config["watermark_config"]
+                    input_video = video_list[0]
+                    duration = clip_durations[0]
+                    intervals = build_watermark_intervals(
+                        duration,
+                        watermark_config["explicit_enabled"],
+                        watermark_config["explicit_ranges"],
+                        watermark_config["tail_enabled"],
+                        watermark_config["tail_seconds"],
+                    )
+                    self.queue.put(("log_slot", slot_idx, f"水印模式：{watermark_config['mode']}"))
+                    if intervals:
+                        self.queue.put(("log_slot", slot_idx, f"命中时间段数：{len(intervals)}"))
+
+                    def on_progress_task(remaining):
+                        minutes = int(remaining // 60)
+                        seconds = int(remaining % 60)
+                        self.queue.put(("title_slot", slot_idx, f"{output_name} (ETA: {minutes:02d}:{seconds:02d})"))
+                        self.queue.put(("eta", remaining))
+
+                    if watermark_config["mode"] == WATERMARK_MODE_IMAGE:
+                        ok, logtxt = apply_image_watermark(
+                            ffmpeg,
+                            ffprobe,
+                            input_video,
+                            output_path,
+                            watermark_config["image_path"],
+                            watermark_config["scale_percent"],
+                            watermark_config["opacity_percent"],
+                            watermark_config["x_pos"],
+                            watermark_config["y_pos"],
+                            intervals,
+                            progress_total=duration,
+                            on_progress=on_progress_task,
+                            on_proc=on_proc,
+                        )
+                    else:
+                        ok, logtxt = apply_text_watermark(
+                            ffmpeg,
+                            ffprobe,
+                            input_video,
+                            output_path,
+                            watermark_config["text_content"],
+                            watermark_config["font_size"],
+                            watermark_config["opacity_percent"],
+                            watermark_config["x_pos"],
+                            watermark_config["y_pos"],
+                            intervals,
+                            progress_total=duration,
+                            on_progress=on_progress_task,
+                            on_proc=on_proc,
+                        )
+
+                    if ok:
+                        self.queue.put(("log_slot", slot_idx, "加水印成功"))
+                        return True, "watermark"
+                    safe_remove(output_path)
+                    self.queue.put(("log_slot", slot_idx, f"失败: {logtxt}"))
+                    return False, logtxt
 
                 if resolution_mode == "custom":
                     target_resolution = custom_resolution
@@ -1796,6 +2662,7 @@ class App:
             middle_count = len(list_videos(self.middle_dir.get())) if self.middle_dir.get() else 0
             back_count = len(list_videos(self.back_dir.get())) if self.back_dir.get() else 0
             random_count = len(list_videos(self.random_dir.get())) if self.random_dir.get() else 0
+            watermark_count = len(list_videos(self.watermark_dir.get())) if self.watermark_dir.get() else 0
             pick_count = int(self.random_pick_count.get() or 2)
             random_order_mode = self.random_order_mode.get()
 
@@ -1803,12 +2670,15 @@ class App:
             self.middle_count_var.set(f"共 {middle_count} 个视频")
             self.back_count_var.set(f"共 {back_count} 个视频")
             self.random_dir_count_var.set(f"共 {random_count} 个视频")
+            self.watermark_dir_count_var.set(f"共 {watermark_count} 个视频")
             self.random_pick_info_var.set(f"当前拼接数量：{pick_count} 段")
 
             if self.tab_mode.get() == "structured":
                 total = front_count * back_count if middle_count == 0 else front_count * middle_count * back_count
-            else:
+            elif self.tab_mode.get() == "random":
                 total = self.count_random_outputs(random_count, pick_count, random_order_mode)
+            else:
+                total = watermark_count
             self.estimated_var.set(f"预计输出数量：{total}")
         except Exception:
             pass
