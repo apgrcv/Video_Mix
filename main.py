@@ -30,6 +30,8 @@ LIGHT_TRANSITION_OPTIONS = ["0.4", "0.6", "0.8", "1.0"]
 DEFAULT_LIGHT_TRANSITION_SECONDS = "0.6"
 WATERMARK_MODE_IMAGE = "图片水印"
 WATERMARK_MODE_TEXT = "文字水印"
+SOURCE_MODE_DIRECTORY = "directory"
+SOURCE_MODE_FILES = "files"
 
 
 def list_videos(directory):
@@ -37,6 +39,10 @@ def list_videos(directory):
     if not base.exists():
         return []
     return sorted([p for p in base.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS])
+
+
+def is_video_file(path_obj):
+    return path_obj.is_file() and path_obj.suffix.lower() in VIDEO_EXTENSIONS
 
 
 def find_binary(name):
@@ -899,13 +905,17 @@ def build_watermark_intervals(duration, explicit_enabled, explicit_ranges, tail_
     return cleaned
 
 
-def get_watermark_video_params(use_hardware):
+def get_watermark_video_params(use_hardware, fast_mode=False):
     if use_hardware:
+        if fast_mode:
+            return ["-c:v", "h264_videotoolbox", "-b:v", "3500k", "-maxrate", "4500k", "-bufsize", "7000k", "-allow_sw", "1"]
         return ["-c:v", "h264_videotoolbox", "-b:v", "5000k", "-allow_sw", "1"]
+    if fast_mode:
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28"]
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
 
 
-def run_ffmpeg_progress_command(cmd, progress_total=None, on_progress=None, on_proc=None):
+def run_ffmpeg_progress_command(cmd, progress_total=None, on_progress=None, on_proc=None, stop_event=None):
     try:
         startupinfo = None
         if sys.platform == "win32":
@@ -930,6 +940,16 @@ def run_ffmpeg_progress_command(cmd, progress_total=None, on_progress=None, on_p
     out_lines = []
     try:
         while True:
+            if stop_event and stop_event.is_set():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return False, "Cancelled"
             line = proc.stdout.readline()
             if line:
                 stripped = line.strip()
@@ -980,9 +1000,11 @@ def apply_image_watermark(
     x_pos,
     y_pos,
     intervals,
+    fast_mode=False,
     progress_total=None,
     on_progress=None,
     on_proc=None,
+    stop_event=None,
 ):
     enable_expr = build_enable_expression(intervals)
     filter_complex = build_watermark_image_filter(scale_percent, opacity_percent, x_pos, y_pos, enable_expr)
@@ -1000,7 +1022,7 @@ def apply_image_watermark(
         "[v]",
         "-map",
         "0:a?",
-    ] + get_watermark_video_params(use_hardware) + [
+    ] + get_watermark_video_params(use_hardware, fast_mode=fast_mode) + [
         "-c:a",
         "copy",
         "-movflags",
@@ -1015,6 +1037,7 @@ def apply_image_watermark(
         progress_total=progress_total or probe_duration(ffprobe, input_video) or 0.0,
         on_progress=on_progress,
         on_proc=on_proc,
+        stop_event=stop_event,
     )
     if success:
         return True, output_text
@@ -1032,7 +1055,7 @@ def apply_image_watermark(
             "[v]",
             "-map",
             "0:a?",
-        ] + get_watermark_video_params(False) + [
+        ] + get_watermark_video_params(False, fast_mode=fast_mode) + [
             "-c:a",
             "copy",
             "-movflags",
@@ -1047,6 +1070,7 @@ def apply_image_watermark(
             progress_total=progress_total or probe_duration(ffprobe, input_video) or 0.0,
             on_progress=on_progress,
             on_proc=on_proc,
+            stop_event=stop_event,
         )
         return fallback_success, output_text + "\n" + fallback_output
     return False, output_text
@@ -1063,9 +1087,11 @@ def apply_text_watermark(
     x_pos,
     y_pos,
     intervals,
+    fast_mode=False,
     progress_total=None,
     on_progress=None,
     on_proc=None,
+    stop_event=None,
 ):
     enable_expr = build_enable_expression(intervals)
     opacity_ratio = max(0.0, min(1.0, opacity_percent / 100.0))
@@ -1103,7 +1129,7 @@ def apply_text_watermark(
             "0:v",
             "-map",
             "0:a?",
-        ] + get_watermark_video_params(use_hardware) + [
+        ] + get_watermark_video_params(use_hardware, fast_mode=fast_mode) + [
             "-c:a",
             "copy",
             "-movflags",
@@ -1118,6 +1144,7 @@ def apply_text_watermark(
             progress_total=progress_total or probe_duration(ffprobe, input_video) or 0.0,
             on_progress=on_progress,
             on_proc=on_proc,
+            stop_event=stop_event,
         )
         if success:
             return True, output_text
@@ -1133,7 +1160,7 @@ def apply_text_watermark(
                 "0:v",
                 "-map",
                 "0:a?",
-            ] + get_watermark_video_params(False) + [
+            ] + get_watermark_video_params(False, fast_mode=fast_mode) + [
                 "-c:a",
                 "copy",
                 "-movflags",
@@ -1148,6 +1175,7 @@ def apply_text_watermark(
                 progress_total=progress_total or probe_duration(ffprobe, input_video) or 0.0,
                 on_progress=on_progress,
                 on_proc=on_proc,
+                stop_event=stop_event,
             )
             return fallback_success, output_text + "\n" + fallback_output
         return False, output_text
@@ -1193,12 +1221,18 @@ class App:
         self.watermark_intervals_enabled = BooleanVar(value=False)
         self.watermark_tail_enabled = BooleanVar(value=False)
         self.watermark_tail_seconds = StringVar(value="3")
+        self.watermark_fast_mode = BooleanVar(value=False)
         self.mode = StringVar(value="优先无损（失败自动转兼容）")
         self.resolution_mode = StringVar(value="custom")
         self.custom_width = IntVar(value=1080)
         self.custom_height = IntVar(value=1920)
         self.skip_existing = BooleanVar(value=True)
         self.max_workers = IntVar(value=max(2, min(4, os.cpu_count() or 2)))
+        self.front_source_mode = StringVar(value=SOURCE_MODE_DIRECTORY)
+        self.middle_source_mode = StringVar(value=SOURCE_MODE_DIRECTORY)
+        self.back_source_mode = StringVar(value=SOURCE_MODE_DIRECTORY)
+        self.random_source_mode = StringVar(value=SOURCE_MODE_DIRECTORY)
+        self.watermark_source_mode = StringVar(value=SOURCE_MODE_DIRECTORY)
         self.proc_lock = threading.Lock()
         self.running_procs = set()
         self.running_outputs = set()
@@ -1209,6 +1243,43 @@ class App:
         self.directory_memory = self.load_directory_memory()
         self.watermark_interval_rows = []
         self.watermark_preview_photo = None
+        self.source_fields = {
+            "front_dir": {
+                "label": "前半段素材",
+                "dir_var": self.front_dir,
+                "mode_var": self.front_source_mode,
+                "files": [],
+                "optional": False,
+            },
+            "middle_dir": {
+                "label": "中段素材（可选）",
+                "dir_var": self.middle_dir,
+                "mode_var": self.middle_source_mode,
+                "files": [],
+                "optional": True,
+            },
+            "back_dir": {
+                "label": "后半段素材",
+                "dir_var": self.back_dir,
+                "mode_var": self.back_source_mode,
+                "files": [],
+                "optional": False,
+            },
+            "random_dir": {
+                "label": "候选素材",
+                "dir_var": self.random_dir,
+                "mode_var": self.random_source_mode,
+                "files": [],
+                "optional": False,
+            },
+            "watermark_dir": {
+                "label": "待处理视频",
+                "dir_var": self.watermark_dir,
+                "mode_var": self.watermark_source_mode,
+                "files": [],
+                "optional": False,
+            },
+        }
 
         self.build_ui()
         self.restore_directory_state()
@@ -1298,19 +1369,11 @@ class App:
         watermark_tab.grid_columnconfigure(0, weight=1)
         self.path_tabs.add(watermark_tab, text="加水印")
 
-        front_row = self.build_path_row(structured_tab, "前半段目录", self.front_dir, self.pick_front)
-        middle_row = self.build_path_row(structured_tab, "中段目录 (可选)", self.middle_dir, self.pick_middle)
-        back_row = self.build_path_row(structured_tab, "后半段目录", self.back_dir, self.pick_back)
-        self.front_count_var = StringVar(value="共 0 个视频")
-        self.middle_count_var = StringVar(value="共 0 个视频")
-        self.back_count_var = StringVar(value="共 0 个视频")
-        tk.Label(front_row, textvariable=self.front_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
-        tk.Label(middle_row, textvariable=self.middle_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
-        tk.Label(back_row, textvariable=self.back_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
+        self.build_source_row(structured_tab, "front_dir")
+        self.build_source_row(structured_tab, "middle_dir")
+        self.build_source_row(structured_tab, "back_dir")
 
-        random_dir_row = self.build_path_row(random_tab, "文件目录", self.random_dir, self.pick_random_dir)
-        self.random_dir_count_var = StringVar(value="共 0 个视频")
-        tk.Label(random_dir_row, textvariable=self.random_dir_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
+        self.build_source_row(random_tab, "random_dir")
 
         random_pick_row = tk.Frame(random_tab, bg=bg_color)
         random_pick_row.grid(row=1, column=0, sticky="ew", pady=4)
@@ -1332,15 +1395,13 @@ class App:
         random_order_menu["menu"].config(bg="white", fg=fg_color, font=font_normal)
         random_order_menu.grid(row=0, column=1, sticky="w", padx=(10, 0))
 
-        watermark_dir_row = self.build_path_row(watermark_tab, "视频目录", self.watermark_dir, self.pick_watermark_dir)
-        self.watermark_dir_count_var = StringVar(value="共 0 个视频")
-        tk.Label(watermark_dir_row, textvariable=self.watermark_dir_count_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
+        self.build_source_row(watermark_tab, "watermark_dir")
 
         watermark_help_row = tk.Frame(watermark_tab, bg=bg_color)
         watermark_help_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         tk.Label(
             watermark_help_row,
-            text="该功能会对当前目录内所有视频批量加水印，结果输出到下方的输出目录。",
+            text="可处理整个目录内的视频，也可只处理手动选择的部分视频，结果输出到下方的输出目录。",
             font=font_small,
             bg=bg_color,
             fg="#666666",
@@ -1350,22 +1411,15 @@ class App:
         shared_path_content = tk.Frame(path_section, bg=bg_color)
         shared_path_content.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         shared_path_content.grid_columnconfigure(0, weight=1)
-        out_row = self.build_path_row(shared_path_content, "输出目录", self.output_dir, self.pick_output)
+        out_row = self.build_path_row(shared_path_content, "输出目录", self.output_dir, self.pick_output, button_text="选择目录")
         self.estimated_var = StringVar(value="预计输出数量：0")
         tk.Label(out_row, textvariable=self.estimated_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0))
 
-        self.front_dir.trace_add("write", lambda *args: self.update_counts())
-        self.middle_dir.trace_add("write", lambda *args: self.update_counts())
-        self.back_dir.trace_add("write", lambda *args: self.update_counts())
-        self.random_dir.trace_add("write", lambda *args: self.update_counts())
+        for field_name, source in self.source_fields.items():
+            source["dir_var"].trace_add("write", lambda *args, field_name=field_name: self.handle_source_dir_change(field_name))
+            source["mode_var"].trace_add("write", lambda *args, field_name=field_name: self.handle_source_mode_change(field_name))
         self.random_pick_count.trace_add("write", lambda *args: self.update_counts())
         self.random_order_mode.trace_add("write", lambda *args: self.update_counts())
-        self.watermark_dir.trace_add("write", lambda *args: self.update_counts())
-        self.front_dir.trace_add("write", lambda *args: self.handle_directory_var_change("front_dir", self.front_dir))
-        self.middle_dir.trace_add("write", lambda *args: self.handle_directory_var_change("middle_dir", self.middle_dir))
-        self.back_dir.trace_add("write", lambda *args: self.handle_directory_var_change("back_dir", self.back_dir))
-        self.random_dir.trace_add("write", lambda *args: self.handle_directory_var_change("random_dir", self.random_dir))
-        self.watermark_dir.trace_add("write", lambda *args: self.handle_directory_var_change("watermark_dir", self.watermark_dir))
         self.output_dir.trace_add("write", lambda *args: self.handle_directory_var_change("output_dir", self.output_dir))
         self.update_counts()
 
@@ -1515,8 +1569,23 @@ class App:
             activeforeground=fg_color,
         ).grid(row=0, column=2, sticky="w", padx=(10, 0))
 
+        speed_row = tk.Frame(watermark_options_frame, bg=bg_color)
+        speed_row.grid(row=1, column=0, sticky="ew", pady=4)
+        tk.Label(speed_row, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        tk.Checkbutton(
+            speed_row,
+            text="极速模式",
+            variable=self.watermark_fast_mode,
+            font=font_normal,
+            bg=bg_color,
+            fg=fg_color,
+            activebackground=bg_color,
+            activeforeground=fg_color,
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        tk.Label(speed_row, text="更激进的编码参数，速度更快，画质和体积控制会更偏向速度。", font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(2, 0))
+
         image_frame = tk.Frame(watermark_options_frame, bg=bg_color)
-        image_frame.grid(row=1, column=0, sticky="ew", pady=4)
+        image_frame.grid(row=2, column=0, sticky="ew", pady=4)
         image_frame.grid_columnconfigure(1, weight=1)
         tk.Label(image_frame, text="PNG 水印", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="w").grid(row=0, column=0, sticky="w")
         tk.Entry(image_frame, textvariable=self.watermark_image_path, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=1, sticky="ew", padx=(10, 10))
@@ -1525,7 +1594,7 @@ class App:
         tk.Label(image_frame, textvariable=self.watermark_image_meta_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(4, 0))
 
         image_param_row = tk.Frame(watermark_options_frame, bg=bg_color)
-        image_param_row.grid(row=2, column=0, sticky="ew", pady=4)
+        image_param_row.grid(row=3, column=0, sticky="ew", pady=4)
         tk.Label(image_param_row, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
         tk.Label(image_param_row, text="大小%", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
         tk.Entry(image_param_row, textvariable=self.watermark_image_size_percent, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=2, sticky="w", padx=(4, 0))
@@ -1537,14 +1606,14 @@ class App:
         tk.Entry(image_param_row, textvariable=self.watermark_image_y, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=8, sticky="w", padx=(4, 0))
 
         text_frame = tk.Frame(watermark_options_frame, bg=bg_color)
-        text_frame.grid(row=3, column=0, sticky="ew", pady=4)
+        text_frame.grid(row=4, column=0, sticky="ew", pady=4)
         text_frame.grid_columnconfigure(1, weight=1)
         tk.Label(text_frame, text="文字水印", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="nw").grid(row=0, column=0, sticky="nw")
         self.watermark_text_widget = ScrolledText(text_frame, height=4, font=("Helvetica", 11), bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db")
         self.watermark_text_widget.grid(row=0, column=1, sticky="ew", padx=(10, 0))
 
         text_param_row = tk.Frame(watermark_options_frame, bg=bg_color)
-        text_param_row.grid(row=4, column=0, sticky="ew", pady=4)
+        text_param_row.grid(row=5, column=0, sticky="ew", pady=4)
         tk.Label(text_param_row, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
         tk.Label(text_param_row, text="字号", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
         tk.Entry(text_param_row, textvariable=self.watermark_text_size, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=2, sticky="w", padx=(4, 0))
@@ -1556,7 +1625,7 @@ class App:
         tk.Entry(text_param_row, textvariable=self.watermark_text_y, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=8, sticky="w", padx=(4, 0))
 
         preview_row = tk.Frame(watermark_options_frame, bg=bg_color)
-        preview_row.grid(row=5, column=0, sticky="ew", pady=4)
+        preview_row.grid(row=6, column=0, sticky="ew", pady=4)
         tk.Label(preview_row, text="预览尺寸", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="w").grid(row=0, column=0, sticky="w")
         tk.Label(preview_row, text="宽", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=1, sticky="w", padx=(10, 0))
         tk.Entry(preview_row, textvariable=self.watermark_preview_width, width=6, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=2, sticky="w", padx=(4, 0))
@@ -1565,17 +1634,17 @@ class App:
         tk.Button(preview_row, text="预览", command=self.render_watermark_preview, font=self.font_normal, highlightbackground=bg_color).grid(row=0, column=5, sticky="w", padx=(12, 0))
 
         preview_canvas_row = tk.Frame(watermark_options_frame, bg=bg_color)
-        preview_canvas_row.grid(row=6, column=0, sticky="ew", pady=(4, 8))
+        preview_canvas_row.grid(row=7, column=0, sticky="ew", pady=(4, 8))
         tk.Label(preview_canvas_row, text="预览画布", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="nw").grid(row=0, column=0, sticky="nw")
         self.watermark_preview_canvas = tk.Canvas(preview_canvas_row, width=360, height=240, bg="white", highlightthickness=1, highlightbackground="#d1d5db")
         self.watermark_preview_canvas.grid(row=0, column=1, sticky="w", padx=(10, 0))
 
         schedule_title_row = tk.Frame(watermark_options_frame, bg=bg_color)
-        schedule_title_row.grid(row=7, column=0, sticky="ew", pady=(8, 2))
+        schedule_title_row.grid(row=8, column=0, sticky="ew", pady=(8, 2))
         tk.Label(schedule_title_row, text="出现时间配置", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=0, sticky="w")
 
         explicit_toggle_row = tk.Frame(watermark_options_frame, bg=bg_color)
-        explicit_toggle_row.grid(row=8, column=0, sticky="ew", pady=4)
+        explicit_toggle_row.grid(row=9, column=0, sticky="ew", pady=4)
         tk.Label(explicit_toggle_row, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
         tk.Checkbutton(
             explicit_toggle_row,
@@ -1592,10 +1661,10 @@ class App:
         self.watermark_add_interval_button.grid(row=0, column=2, sticky="w", padx=(12, 0))
 
         self.watermark_intervals_frame = tk.Frame(watermark_options_frame, bg=bg_color)
-        self.watermark_intervals_frame.grid(row=9, column=0, sticky="ew", pady=(0, 4))
+        self.watermark_intervals_frame.grid(row=10, column=0, sticky="ew", pady=(0, 4))
 
         tail_row = tk.Frame(watermark_options_frame, bg=bg_color)
-        tail_row.grid(row=10, column=0, sticky="ew", pady=4)
+        tail_row.grid(row=11, column=0, sticky="ew", pady=4)
         tk.Label(tail_row, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
         tk.Checkbutton(
             tail_row,
@@ -1727,7 +1796,125 @@ class App:
         self.on_mousewheel_linux(event)
         return "break"
 
-    def build_path_row(self, parent, label, var, command):
+    def build_source_row(self, parent, field_name):
+        source = self.source_fields[field_name]
+        row = parent.grid_size()[1]
+        row_frame = tk.Frame(parent, bg=self.ui_bg, padx=10, pady=10, highlightthickness=1, highlightbackground="#e5e7eb")
+        row_frame.grid(row=row, column=0, sticky="ew", pady=6)
+        row_frame.grid_columnconfigure(0, weight=1)
+
+        header = tk.Frame(row_frame, bg=self.ui_bg)
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(1, weight=1)
+        tk.Label(header, text=source["label"], font=self.font_normal, bg=self.ui_bg, fg=self.ui_fg, anchor="w").grid(row=0, column=0, sticky="w")
+
+        mode_frame = tk.Frame(header, bg=self.ui_bg)
+        mode_frame.grid(row=0, column=1, sticky="e")
+        dir_toggle = tk.Radiobutton(
+            mode_frame,
+            text="目录",
+            variable=source["mode_var"],
+            value=SOURCE_MODE_DIRECTORY,
+            indicatoron=False,
+            width=8,
+            font=self.font_small,
+            bg="white",
+            fg=self.ui_fg,
+            selectcolor="#dbeafe",
+            activebackground="#eff6ff",
+            activeforeground=self.ui_fg,
+            relief="flat",
+            bd=1,
+            highlightthickness=1,
+            highlightbackground="#cbd5e1",
+        )
+        dir_toggle.grid(row=0, column=0, sticky="e")
+        files_toggle = tk.Radiobutton(
+            mode_frame,
+            text="指定文件",
+            variable=source["mode_var"],
+            value=SOURCE_MODE_FILES,
+            indicatoron=False,
+            width=8,
+            font=self.font_small,
+            bg="white",
+            fg=self.ui_fg,
+            selectcolor="#dbeafe",
+            activebackground="#eff6ff",
+            activeforeground=self.ui_fg,
+            relief="flat",
+            bd=1,
+            highlightthickness=1,
+            highlightbackground="#cbd5e1",
+        )
+        files_toggle.grid(row=0, column=1, sticky="e", padx=(6, 0))
+
+        action_row = tk.Frame(row_frame, bg=self.ui_bg)
+        action_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        action_row.grid_columnconfigure(0, weight=1)
+
+        source["display_var"] = StringVar(value="未选择目录")
+        display_entry = tk.Entry(
+            action_row,
+            textvariable=source["display_var"],
+            font=self.font_normal,
+            bg="white",
+            fg=self.ui_fg,
+            state="readonly",
+            readonlybackground="white",
+            highlightthickness=1,
+            highlightbackground="#d1d5db",
+        )
+        display_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+
+        select_dir_button = tk.Button(
+            action_row,
+            text="选择目录",
+            command=lambda field_name=field_name: self.pick_source_directory(field_name),
+            font=self.font_normal,
+            highlightbackground=self.ui_bg,
+        )
+        select_dir_button.grid(row=0, column=1, sticky="e")
+
+        select_files_button = tk.Button(
+            action_row,
+            text="选择文件",
+            command=lambda field_name=field_name: self.pick_source_files(field_name),
+            font=self.font_normal,
+            highlightbackground=self.ui_bg,
+        )
+        select_files_button.grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+        view_files_button = tk.Button(
+            action_row,
+            text="查看",
+            command=lambda field_name=field_name: self.open_selected_files_dialog(field_name),
+            font=self.font_normal,
+            highlightbackground=self.ui_bg,
+        )
+        view_files_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+        clear_files_button = tk.Button(
+            action_row,
+            text="清空",
+            command=lambda field_name=field_name: self.clear_source_files(field_name),
+            font=self.font_normal,
+            highlightbackground=self.ui_bg,
+        )
+        clear_files_button.grid(row=0, column=4, sticky="e", padx=(8, 0))
+
+        source["count_var"] = StringVar(value="未选择目录")
+        tk.Label(row_frame, textvariable=source["count_var"], font=self.font_small, bg=self.ui_bg, fg="#666666").grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        source["select_dir_button"] = select_dir_button
+        source["select_files_button"] = select_files_button
+        source["view_files_button"] = view_files_button
+        source["clear_files_button"] = clear_files_button
+        source["display_entry"] = display_entry
+        self.refresh_source_widgets(field_name)
+        return row_frame
+
+    def build_path_row(self, parent, label, var, command, button_text="选择"):
         row = parent.grid_size()[1]
         row_frame = tk.Frame(parent, bg=self.ui_bg)
         row_frame.grid(row=row, column=0, sticky="ew", pady=4)
@@ -1736,8 +1923,260 @@ class App:
         tk.Label(row_frame, text=label, font=self.font_normal, bg=self.ui_bg, fg=self.ui_fg, width=12, anchor="w").grid(row=0, column=0, sticky="w")
         entry = tk.Entry(row_frame, textvariable=var, font=self.font_normal, bg="white", fg=self.ui_fg, highlightthickness=1, highlightbackground="#d1d5db")
         entry.grid(row=0, column=1, sticky="ew", padx=(10, 10))
-        tk.Button(row_frame, text="选择", command=command, font=self.font_normal, highlightbackground=self.ui_bg).grid(row=0, column=2, sticky="e")
+        tk.Button(row_frame, text=button_text, command=command, font=self.font_normal, highlightbackground=self.ui_bg).grid(row=0, column=2, sticky="e")
         return row_frame
+
+    def get_source_files_key(self, field_name):
+        return f"{field_name}_files"
+
+    def get_source_mode_key(self, field_name):
+        return f"{field_name}_mode"
+
+    def normalize_source_file_paths(self, paths):
+        normalized = []
+        seen = set()
+        for raw_path in paths:
+            path_str = str(raw_path).strip()
+            if not path_str:
+                continue
+            path_obj = Path(path_str)
+            resolved = str(path_obj)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            normalized.append(resolved)
+        return normalized
+
+    def get_source_file_paths(self, field_name):
+        return list(self.source_fields[field_name]["files"])
+
+    def set_source_file_paths(self, field_name, paths):
+        normalized = self.normalize_source_file_paths(paths)
+        self.source_fields[field_name]["files"] = normalized
+        self.directory_memory[self.get_source_files_key(field_name)] = normalized
+        if normalized:
+            self.directory_memory["last_browsed_dir"] = str(Path(normalized[0]).parent)
+        self.save_directory_memory()
+
+    def get_source_file_stats(self, field_name):
+        valid_paths = []
+        invalid_count = 0
+        for raw_path in self.get_source_file_paths(field_name):
+            path_obj = Path(raw_path)
+            if is_video_file(path_obj):
+                valid_paths.append(path_obj)
+            else:
+                invalid_count += 1
+        folder_count = len({str(path.parent) for path in valid_paths})
+        return valid_paths, invalid_count, folder_count
+
+    def get_source_videos(self, field_name):
+        source = self.source_fields[field_name]
+        if source["mode_var"].get() == SOURCE_MODE_FILES:
+            valid_paths, _invalid_count, _folder_count = self.get_source_file_stats(field_name)
+            return valid_paths
+        directory = source["dir_var"].get().strip()
+        return list_videos(directory) if directory else []
+
+    def source_has_selection(self, field_name):
+        source = self.source_fields[field_name]
+        if source["mode_var"].get() == SOURCE_MODE_FILES:
+            return len(self.get_source_file_paths(field_name)) > 0
+        return bool(source["dir_var"].get().strip())
+
+    def get_initial_source_browse_dir(self, field_name):
+        source = self.source_fields[field_name]
+        current_dir = source["dir_var"].get().strip()
+        if current_dir and Path(current_dir).is_dir():
+            return current_dir
+        valid_paths, _invalid_count, _folder_count = self.get_source_file_stats(field_name)
+        if valid_paths:
+            return str(valid_paths[0].parent)
+        remembered = self.directory_memory.get(field_name)
+        if remembered and Path(remembered).is_dir():
+            return remembered
+        last_browsed = self.directory_memory.get("last_browsed_dir")
+        if last_browsed and Path(last_browsed).is_dir():
+            return last_browsed
+        return str(Path(__file__).resolve().parent)
+
+    def build_source_summary(self, field_name):
+        source = self.source_fields[field_name]
+        mode = source["mode_var"].get()
+        if mode == SOURCE_MODE_FILES:
+            raw_paths = self.get_source_file_paths(field_name)
+            valid_paths, invalid_count, folder_count = self.get_source_file_stats(field_name)
+            if raw_paths:
+                display_text = f"已选择 {len(raw_paths)} 个文件"
+            else:
+                display_text = "未选择文件"
+            if valid_paths:
+                summary = f"已选择 {len(valid_paths)} 个视频"
+                if folder_count:
+                    summary += f"，来自 {folder_count} 个文件夹"
+                if invalid_count:
+                    summary += f"；{invalid_count} 个文件已失效"
+            else:
+                summary = "请选择一个或多个视频文件"
+                if invalid_count:
+                    summary = f"当前没有有效视频；{invalid_count} 个文件已失效"
+            return display_text, summary
+
+        directory = source["dir_var"].get().strip()
+        if directory:
+            videos = list_videos(directory)
+            display_text = directory
+            if videos:
+                summary = f"共 {len(videos)} 个视频"
+            else:
+                summary = "目录中未找到可用视频"
+        else:
+            display_text = "未选择目录"
+            summary = "未选择目录"
+            if source.get("optional"):
+                summary = "未选择素材，将跳过这一段"
+        return display_text, summary
+
+    def refresh_source_widgets(self, field_name):
+        source = self.source_fields[field_name]
+        display_text, summary = self.build_source_summary(field_name)
+        source["display_var"].set(display_text)
+        source["count_var"].set(summary)
+        is_files_mode = source["mode_var"].get() == SOURCE_MODE_FILES
+        has_selected_files = len(self.get_source_file_paths(field_name)) > 0
+        if is_files_mode:
+            source["select_dir_button"].grid_remove()
+            source["select_files_button"].grid()
+            source["view_files_button"].grid()
+            source["clear_files_button"].grid()
+            source["view_files_button"].configure(state="normal" if has_selected_files else "disabled")
+            source["clear_files_button"].configure(state="normal" if has_selected_files else "disabled")
+        else:
+            source["select_dir_button"].grid()
+            source["select_files_button"].grid_remove()
+            source["view_files_button"].grid_remove()
+            source["clear_files_button"].grid_remove()
+
+    def handle_source_dir_change(self, field_name):
+        source = self.source_fields[field_name]
+        self.handle_directory_var_change(field_name, source["dir_var"])
+        self.refresh_source_widgets(field_name)
+        self.update_counts()
+
+    def handle_source_mode_change(self, field_name):
+        self.directory_memory[self.get_source_mode_key(field_name)] = self.source_fields[field_name]["mode_var"].get()
+        self.save_directory_memory()
+        self.refresh_source_widgets(field_name)
+        self.update_counts()
+
+    def pick_source_directory(self, field_name):
+        source = self.source_fields[field_name]
+        initial_dir = self.get_initial_source_browse_dir(field_name)
+        path = filedialog.askdirectory(initialdir=initial_dir)
+        if path:
+            source["dir_var"].set(path)
+            self.remember_directory(field_name, path)
+            self.refresh_source_widgets(field_name)
+            self.update_counts()
+
+    def pick_source_files(self, field_name, append=False, parent=None):
+        initial_dir = self.get_initial_source_browse_dir(field_name)
+        paths = filedialog.askopenfilenames(
+            parent=parent,
+            initialdir=initial_dir,
+            title=f"选择{self.source_fields[field_name]['label']}",
+            filetypes=[("视频文件", "*.mp4 *.mov *.mkv *.avi *.m4v"), ("所有文件", "*.*")],
+        )
+        if not paths:
+            return
+        existing_paths = self.get_source_file_paths(field_name) if append else []
+        self.set_source_file_paths(field_name, existing_paths + list(paths))
+        self.refresh_source_widgets(field_name)
+        self.update_counts()
+
+    def clear_source_files(self, field_name):
+        self.set_source_file_paths(field_name, [])
+        self.refresh_source_widgets(field_name)
+        self.update_counts()
+
+    def open_selected_files_dialog(self, field_name):
+        source = self.source_fields[field_name]
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"{source['label']} - 已选文件")
+        dialog.transient(self.root)
+        dialog.geometry("760x440")
+        dialog.minsize(680, 360)
+        dialog.configure(bg=self.ui_bg)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+
+        summary_var = StringVar()
+        tk.Label(dialog, text=source["label"], font=self.font_normal, bg=self.ui_bg, fg=self.ui_fg).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 4))
+        tk.Label(dialog, textvariable=summary_var, font=self.font_small, bg=self.ui_bg, fg="#666666").grid(row=0, column=0, sticky="e", padx=16, pady=(16, 4))
+
+        list_frame = tk.Frame(dialog, bg=self.ui_bg)
+        list_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 12))
+        list_frame.grid_columnconfigure(0, weight=1)
+        list_frame.grid_rowconfigure(0, weight=1)
+
+        listbox = tk.Listbox(
+            list_frame,
+            selectmode=tk.EXTENDED,
+            font=("Menlo", 11),
+            bg="white",
+            fg=self.ui_fg,
+            highlightthickness=1,
+            highlightbackground="#d1d5db",
+        )
+        listbox.grid(row=0, column=0, sticky="nsew")
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        button_row = tk.Frame(dialog, bg=self.ui_bg)
+        button_row.grid(row=2, column=0, sticky="e", padx=16, pady=(0, 16))
+
+        def refresh_list():
+            listbox.delete(0, "end")
+            raw_paths = self.get_source_file_paths(field_name)
+            valid_paths, invalid_count, folder_count = self.get_source_file_stats(field_name)
+            for raw_path in raw_paths:
+                path_obj = Path(raw_path)
+                prefix = "[失效] " if not is_video_file(path_obj) else ""
+                listbox.insert("end", f"{prefix}{path_obj.name}    {path_obj.parent}")
+            summary_text = f"共 {len(valid_paths)} 个有效视频"
+            if folder_count:
+                summary_text += f"，来自 {folder_count} 个文件夹"
+            if invalid_count:
+                summary_text += f"；{invalid_count} 个已失效"
+            if not raw_paths:
+                summary_text = "当前未选择文件"
+            summary_var.set(summary_text)
+
+        def append_files():
+            self.pick_source_files(field_name, append=True, parent=dialog)
+            refresh_list()
+
+        def remove_selected():
+            selected = listbox.curselection()
+            if not selected:
+                return
+            raw_paths = self.get_source_file_paths(field_name)
+            remaining = [path for index, path in enumerate(raw_paths) if index not in selected]
+            self.set_source_file_paths(field_name, remaining)
+            self.refresh_source_widgets(field_name)
+            self.update_counts()
+            refresh_list()
+
+        def clear_all():
+            self.clear_source_files(field_name)
+            refresh_list()
+
+        tk.Button(button_row, text="追加选择", command=append_files, font=self.font_normal, highlightbackground=self.ui_bg).grid(row=0, column=0, padx=(0, 8))
+        tk.Button(button_row, text="移除选中", command=remove_selected, font=self.font_normal, highlightbackground=self.ui_bg).grid(row=0, column=1, padx=(0, 8))
+        tk.Button(button_row, text="清空全部", command=clear_all, font=self.font_normal, highlightbackground=self.ui_bg).grid(row=0, column=2, padx=(0, 8))
+        tk.Button(button_row, text="关闭", command=dialog.destroy, font=self.font_normal, highlightbackground=self.ui_bg).grid(row=0, column=3)
+        refresh_list()
 
     def dump_ui_state(self):
         def walk(widget):
@@ -1854,9 +2293,6 @@ class App:
         row_frame.destroy()
         for index, row in enumerate(self.watermark_interval_rows):
             row["frame"].grid_configure(row=index)
-
-    def pick_watermark_dir(self):
-        self.browse_directory("watermark_dir", self.watermark_dir)
 
     def pick_watermark_image(self):
         initial_dir = self.directory_memory.get("last_browsed_dir", str(Path(__file__).resolve().parent))
@@ -1984,6 +2420,7 @@ class App:
                 int(float(self.watermark_preview_width.get())),
                 int(float(self.watermark_preview_height.get())),
             ),
+            "fast_mode": self.watermark_fast_mode.get(),
             "explicit_enabled": self.watermark_intervals_enabled.get(),
             "explicit_ranges": self.parse_watermark_intervals(),
             "tail_enabled": self.watermark_tail_enabled.get(),
@@ -2044,17 +2481,22 @@ class App:
             pass
 
     def restore_directory_state(self):
-        for field_name, target_var in (
-            ("front_dir", self.front_dir),
-            ("middle_dir", self.middle_dir),
-            ("back_dir", self.back_dir),
-            ("random_dir", self.random_dir),
-            ("watermark_dir", self.watermark_dir),
-            ("output_dir", self.output_dir),
-        ):
+        for field_name, target_var in (("output_dir", self.output_dir),):
             remembered = self.directory_memory.get(field_name)
             if remembered and Path(remembered).is_dir():
                 target_var.set(remembered)
+        for field_name, source in self.source_fields.items():
+            remembered = self.directory_memory.get(field_name)
+            if remembered and Path(remembered).is_dir():
+                source["dir_var"].set(remembered)
+            remembered_files = self.directory_memory.get(self.get_source_files_key(field_name), [])
+            if isinstance(remembered_files, list):
+                source["files"] = self.normalize_source_file_paths(remembered_files)
+            remembered_mode = self.directory_memory.get(self.get_source_mode_key(field_name), SOURCE_MODE_DIRECTORY)
+            if remembered_mode in {SOURCE_MODE_DIRECTORY, SOURCE_MODE_FILES}:
+                source["mode_var"].set(remembered_mode)
+            self.refresh_source_widgets(field_name)
+        self.update_counts()
 
     def remember_directory(self, field_name, directory):
         if not directory:
@@ -2091,18 +2533,6 @@ class App:
             target_var.set(path)
             self.remember_directory(field_name, path)
             self.update_counts()
-
-    def pick_front(self):
-        self.browse_directory("front_dir", self.front_dir)
-
-    def pick_middle(self):
-        self.browse_directory("middle_dir", self.middle_dir)
-
-    def pick_back(self):
-        self.browse_directory("back_dir", self.back_dir)
-
-    def pick_random_dir(self):
-        self.browse_directory("random_dir", self.random_dir)
 
     def pick_output(self):
         self.browse_directory("output_dir", self.output_dir)
@@ -2170,15 +2600,12 @@ class App:
         }
 
         if strategy == "structured":
-            front_dir = self.front_dir.get()
-            back_dir = self.back_dir.get()
-            middle_dir = self.middle_dir.get()
-            if not front_dir or not back_dir:
+            if not self.source_has_selection("front_dir") or not self.source_has_selection("back_dir"):
                 messagebox.showerror("错误", "请先选择前半段、后半段和输出目录")
                 return
-            fronts = list_videos(front_dir)
-            middles = list_videos(middle_dir) if middle_dir else []
-            backs = list_videos(back_dir)
+            fronts = self.get_source_videos("front_dir")
+            middles = self.get_source_videos("middle_dir")
+            backs = self.get_source_videos("back_dir")
             if not fronts or not backs:
                 messagebox.showerror("错误", "未找到可用的视频文件")
                 return
@@ -2189,14 +2616,13 @@ class App:
             })
             self.total_tasks = len(fronts) * len(backs) if not middles else len(fronts) * len(middles) * len(backs)
         elif strategy == "random":
-            random_dir = self.random_dir.get()
-            if not random_dir:
-                messagebox.showerror("错误", "请先选择文件目录")
+            if not self.source_has_selection("random_dir"):
+                messagebox.showerror("错误", "请先选择候选素材")
                 return
-            random_videos = list_videos(random_dir)
+            random_videos = self.get_source_videos("random_dir")
             pick_count = int(self.random_pick_count.get() or 2)
             if len(random_videos) < pick_count:
-                messagebox.showerror("错误", f"文件目录中的视频数量不足，至少需要 {pick_count} 个视频")
+                messagebox.showerror("错误", f"候选素材数量不足，至少需要 {pick_count} 个视频")
                 return
             config.update({
                 "random_videos": random_videos,
@@ -2205,13 +2631,12 @@ class App:
             })
             self.total_tasks = self.count_random_outputs(len(random_videos), pick_count, self.random_order_mode.get())
         else:
-            watermark_dir = self.watermark_dir.get()
-            if not watermark_dir:
-                messagebox.showerror("错误", "请先选择视频目录")
+            if not self.source_has_selection("watermark_dir"):
+                messagebox.showerror("错误", "请先选择待处理视频")
                 return
-            watermark_videos = list_videos(watermark_dir)
+            watermark_videos = self.get_source_videos("watermark_dir")
             if not watermark_videos:
-                messagebox.showerror("错误", "视频目录中未找到可用的视频文件")
+                messagebox.showerror("错误", "未找到可用的视频文件")
                 return
             try:
                 watermark_config = self.get_watermark_config()
@@ -2278,6 +2703,7 @@ class App:
 
         self.log("开始合并任务")
         self.start_button.configure(state="disabled")
+        self.stop_button.configure(text="停止任务")
         self.stop_button.configure(state="normal")
 
         config.update({
@@ -2290,10 +2716,14 @@ class App:
 
     def stop_merge(self):
         if self.worker and self.worker.is_alive():
-            self.stop_event.set()
-            self.log("正在停止任务...")
+            if not self.stop_event.is_set():
+                self.stop_event.set()
+                self.log("正在停止任务...")
+            else:
+                self.log("仍在尝试停止任务...")
+            self.stop_button.configure(text="正在停止...")
             self.cancel_current()
-        self.stop_button.configure(state="disabled")
+            self.stop_button.configure(state="normal")
 
     def run_merge(self, config):
         strategy = config["strategy"]
@@ -2419,6 +2849,8 @@ class App:
                         watermark_config["tail_seconds"],
                     )
                     self.queue.put(("log_slot", slot_idx, f"水印模式：{watermark_config['mode']}"))
+                    if watermark_config.get("fast_mode"):
+                        self.queue.put(("log_slot", slot_idx, "编码策略：极速模式"))
                     if intervals:
                         self.queue.put(("log_slot", slot_idx, f"命中时间段数：{len(intervals)}"))
 
@@ -2440,9 +2872,11 @@ class App:
                             watermark_config["x_pos"],
                             watermark_config["y_pos"],
                             intervals,
+                            fast_mode=watermark_config.get("fast_mode", False),
                             progress_total=duration,
                             on_progress=on_progress_task,
                             on_proc=on_proc,
+                            stop_event=self.stop_event,
                         )
                     else:
                         ok, logtxt = apply_text_watermark(
@@ -2456,9 +2890,11 @@ class App:
                             watermark_config["x_pos"],
                             watermark_config["y_pos"],
                             intervals,
+                            fast_mode=watermark_config.get("fast_mode", False),
                             progress_total=duration,
                             on_progress=on_progress_task,
                             on_proc=on_proc,
+                            stop_event=self.stop_event,
                         )
 
                     if ok:
@@ -2618,6 +3054,7 @@ class App:
                     self.eta_label.configure(text=f"剩余时间估算：{minutes:02d}:{seconds:02d}")
                 elif action == "done":
                     self.start_button.configure(state="normal")
+                    self.stop_button.configure(text="停止任务")
                     self.stop_button.configure(state="disabled")
                     self.log("任务完成")
         except queue.Empty:
@@ -2658,19 +3095,16 @@ class App:
 
     def update_counts(self):
         try:
-            front_count = len(list_videos(self.front_dir.get())) if self.front_dir.get() else 0
-            middle_count = len(list_videos(self.middle_dir.get())) if self.middle_dir.get() else 0
-            back_count = len(list_videos(self.back_dir.get())) if self.back_dir.get() else 0
-            random_count = len(list_videos(self.random_dir.get())) if self.random_dir.get() else 0
-            watermark_count = len(list_videos(self.watermark_dir.get())) if self.watermark_dir.get() else 0
+            front_count = len(self.get_source_videos("front_dir"))
+            middle_count = len(self.get_source_videos("middle_dir"))
+            back_count = len(self.get_source_videos("back_dir"))
+            random_count = len(self.get_source_videos("random_dir"))
+            watermark_count = len(self.get_source_videos("watermark_dir"))
             pick_count = int(self.random_pick_count.get() or 2)
             random_order_mode = self.random_order_mode.get()
 
-            self.front_count_var.set(f"共 {front_count} 个视频")
-            self.middle_count_var.set(f"共 {middle_count} 个视频")
-            self.back_count_var.set(f"共 {back_count} 个视频")
-            self.random_dir_count_var.set(f"共 {random_count} 个视频")
-            self.watermark_dir_count_var.set(f"共 {watermark_count} 个视频")
+            for field_name in self.source_fields:
+                self.refresh_source_widgets(field_name)
             self.random_pick_info_var.set(f"当前拼接数量：{pick_count} 段")
 
             if self.tab_mode.get() == "structured":
