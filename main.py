@@ -18,6 +18,10 @@ from tkinter.scrolledtext import ScrolledText
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v"}
+SUPPORTED_AUDIO_FILETYPES = [
+    ("音频文件", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.wma"),
+    ("所有文件", "*.*"),
+]
 APP_VERSION = "2026-03-10-fast-transition"
 RANDOM_ORDER_DISTINCT = "顺序不同算不同结果"
 RANDOM_ORDER_IGNORE = "顺序不同算同一结果"
@@ -1185,6 +1189,53 @@ def apply_text_watermark(
         except OSError:
             pass
 
+
+def replace_video_bgm(
+    ffmpeg,
+    ffprobe,
+    input_video,
+    output_video,
+    bgm_audio,
+    progress_total=None,
+    on_progress=None,
+    on_proc=None,
+    stop_event=None,
+):
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-stream_loop",
+        "-1",
+        "-i",
+        str(bgm_audio),
+        "-i",
+        str(input_video),
+        "-map",
+        "1:v:0",
+        "-map",
+        "0:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(output_video),
+        "-progress",
+        "pipe:1",
+        "-nostats",
+    ]
+    return run_ffmpeg_progress_command(
+        cmd,
+        progress_total=progress_total or probe_duration(ffprobe, input_video) or 0.0,
+        on_progress=on_progress,
+        on_proc=on_proc,
+        stop_event=stop_event,
+    )
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -1200,7 +1251,9 @@ class App:
         self.back_dir = StringVar()
         self.random_dir = StringVar()
         self.watermark_dir = StringVar()
+        self.replace_bgm_dir = StringVar()
         self.output_dir = StringVar()
+        self.replace_bgm_audio_path = StringVar()
         self.random_pick_count = IntVar(value=2)
         self.random_order_mode = StringVar(value=RANDOM_ORDER_DISTINCT)
         self.transition_enabled = BooleanVar(value=False)
@@ -1233,6 +1286,7 @@ class App:
         self.back_source_mode = StringVar(value=SOURCE_MODE_DIRECTORY)
         self.random_source_mode = StringVar(value=SOURCE_MODE_DIRECTORY)
         self.watermark_source_mode = StringVar(value=SOURCE_MODE_DIRECTORY)
+        self.replace_bgm_source_mode = StringVar(value=SOURCE_MODE_DIRECTORY)
         self.proc_lock = threading.Lock()
         self.running_procs = set()
         self.running_outputs = set()
@@ -1276,6 +1330,13 @@ class App:
                 "label": "待处理视频",
                 "dir_var": self.watermark_dir,
                 "mode_var": self.watermark_source_mode,
+                "files": [],
+                "optional": False,
+            },
+            "replace_bgm_dir": {
+                "label": "待处理视频",
+                "dir_var": self.replace_bgm_dir,
+                "mode_var": self.replace_bgm_source_mode,
                 "files": [],
                 "optional": False,
             },
@@ -1369,6 +1430,10 @@ class App:
         watermark_tab.grid_columnconfigure(0, weight=1)
         self.path_tabs.add(watermark_tab, text="加水印")
 
+        replace_bgm_tab = tk.Frame(self.path_tabs, bg=bg_color, padx=10, pady=10)
+        replace_bgm_tab.grid_columnconfigure(0, weight=1)
+        self.path_tabs.add(replace_bgm_tab, text="替换BGM")
+
         self.build_source_row(structured_tab, "front_dir")
         self.build_source_row(structured_tab, "middle_dir")
         self.build_source_row(structured_tab, "back_dir")
@@ -1408,6 +1473,19 @@ class App:
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
 
+        self.build_source_row(replace_bgm_tab, "replace_bgm_dir")
+
+        replace_bgm_help_row = tk.Frame(replace_bgm_tab, bg=bg_color)
+        replace_bgm_help_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        tk.Label(
+            replace_bgm_help_row,
+            text="可处理整个目录内的视频，也可只处理手动选择的部分视频；会完全移除原音频并替换为新的 BGM。",
+            font=font_small,
+            bg=bg_color,
+            fg="#666666",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
         shared_path_content = tk.Frame(path_section, bg=bg_color)
         shared_path_content.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         shared_path_content.grid_columnconfigure(0, weight=1)
@@ -1421,6 +1499,7 @@ class App:
         self.random_pick_count.trace_add("write", lambda *args: self.update_counts())
         self.random_order_mode.trace_add("write", lambda *args: self.update_counts())
         self.output_dir.trace_add("write", lambda *args: self.handle_directory_var_change("output_dir", self.output_dir))
+        self.replace_bgm_audio_path.trace_add("write", lambda *args: self.handle_replace_bgm_audio_change())
         self.update_counts()
 
         options_section = tk.Frame(container, bg=bg_color)
@@ -1692,6 +1771,47 @@ class App:
 
         self.watermark_options_frame.grid_remove()
 
+        replace_bgm_options_frame = tk.Frame(options_section, bg=bg_color)
+        replace_bgm_options_frame.grid(row=1, column=0, sticky="ew")
+        replace_bgm_options_frame.grid_columnconfigure(0, weight=1)
+        self.replace_bgm_options_frame = replace_bgm_options_frame
+
+        bgm_audio_row = tk.Frame(replace_bgm_options_frame, bg=bg_color)
+        bgm_audio_row.grid(row=0, column=0, sticky="ew", pady=4)
+        bgm_audio_row.grid_columnconfigure(1, weight=1)
+        tk.Label(bgm_audio_row, text="BGM 文件", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Entry(
+            bgm_audio_row,
+            textvariable=self.replace_bgm_audio_path,
+            font=font_normal,
+            bg="white",
+            fg=fg_color,
+            highlightthickness=1,
+            highlightbackground="#d1d5db",
+        ).grid(row=0, column=1, sticky="ew", padx=(10, 10))
+        tk.Button(
+            bgm_audio_row,
+            text="选择音频",
+            command=self.pick_replace_bgm_audio,
+            font=self.font_normal,
+            highlightbackground=bg_color,
+        ).grid(row=0, column=2, sticky="e")
+
+        bgm_hint_row = tk.Frame(replace_bgm_options_frame, bg=bg_color)
+        bgm_hint_row.grid(row=1, column=0, sticky="ew", pady=(2, 4))
+        tk.Label(bgm_hint_row, text="", font=font_normal, bg=bg_color, width=10).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            bgm_hint_row,
+            text="视频流直接 copy，不重编码视频；原音频会被完全移除。BGM 不足时自动循环，超出视频时自动截断。",
+            font=font_small,
+            bg=bg_color,
+            fg="#666666",
+            justify="left",
+            anchor="w",
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        self.replace_bgm_options_frame.grid_remove()
+
         progress_section = tk.Frame(container, bg=bg_color)
         progress_section.grid(row=3, column=0, sticky="ew", pady=(0, 15))
         tk.Label(progress_section, text="任务进度", font=font_normal, bg=bg_color, fg=fg_color).grid(row=0, column=0, sticky="w", pady=(0, 8))
@@ -1778,13 +1898,21 @@ class App:
             self.tab_mode.set("structured")
         elif current_index == 1:
             self.tab_mode.set("random")
-        else:
+        elif current_index == 2:
             self.tab_mode.set("watermark")
+        else:
+            self.tab_mode.set("replace_bgm")
         if self.tab_mode.get() == "watermark":
             self.merge_options_frame.grid_remove()
+            self.replace_bgm_options_frame.grid_remove()
             self.watermark_options_frame.grid()
+        elif self.tab_mode.get() == "replace_bgm":
+            self.merge_options_frame.grid_remove()
+            self.watermark_options_frame.grid_remove()
+            self.replace_bgm_options_frame.grid()
         else:
             self.watermark_options_frame.grid_remove()
+            self.replace_bgm_options_frame.grid_remove()
             self.merge_options_frame.grid()
         self.update_counts()
 
@@ -2313,6 +2441,40 @@ class App:
             except Exception:
                 self.watermark_image_meta_var.set("图片尺寸：读取失败")
 
+    def get_initial_audio_browse_dir(self):
+        current_path = self.replace_bgm_audio_path.get().strip()
+        if current_path and Path(current_path).exists():
+            return str(Path(current_path).parent)
+        remembered = self.directory_memory.get("replace_bgm_audio_dir")
+        if remembered and Path(remembered).is_dir():
+            return remembered
+        last_browsed = self.directory_memory.get("last_browsed_dir")
+        if last_browsed and Path(last_browsed).is_dir():
+            return last_browsed
+        return str(Path(__file__).resolve().parent)
+
+    def handle_replace_bgm_audio_change(self):
+        current_path = self.replace_bgm_audio_path.get().strip()
+        if not current_path:
+            return
+        path_obj = Path(current_path)
+        if not path_obj.exists():
+            return
+        self.directory_memory["replace_bgm_audio_path"] = str(path_obj)
+        self.directory_memory["replace_bgm_audio_dir"] = str(path_obj.parent)
+        self.directory_memory["last_browsed_dir"] = str(path_obj.parent)
+        self.save_directory_memory()
+
+    def pick_replace_bgm_audio(self):
+        initial_dir = self.get_initial_audio_browse_dir()
+        path = filedialog.askopenfilename(
+            initialdir=initial_dir,
+            title="选择 BGM 音频文件",
+            filetypes=SUPPORTED_AUDIO_FILETYPES,
+        )
+        if path:
+            self.replace_bgm_audio_path.set(path)
+
     def get_watermark_text_content(self):
         return self.watermark_text_widget.get("1.0", "end").rstrip("\n")
 
@@ -2462,6 +2624,14 @@ class App:
             raise ValueError("图片水印大小百分比必须大于 0")
         return config
 
+    def get_replace_bgm_config(self):
+        audio_path = self.replace_bgm_audio_path.get().strip()
+        if not audio_path or not Path(audio_path).exists():
+            raise ValueError("请先选择有效的 BGM 音频文件")
+        return {
+            "audio_path": audio_path,
+        }
+
     def load_directory_memory(self):
         if not self.settings_path.exists():
             return {}
@@ -2485,6 +2655,9 @@ class App:
             remembered = self.directory_memory.get(field_name)
             if remembered and Path(remembered).is_dir():
                 target_var.set(remembered)
+        remembered_audio = self.directory_memory.get("replace_bgm_audio_path")
+        if remembered_audio and Path(remembered_audio).exists():
+            self.replace_bgm_audio_path.set(remembered_audio)
         for field_name, source in self.source_fields.items():
             remembered = self.directory_memory.get(field_name)
             if remembered and Path(remembered).is_dir():
@@ -2630,7 +2803,7 @@ class App:
                 "random_order_mode": self.random_order_mode.get(),
             })
             self.total_tasks = self.count_random_outputs(len(random_videos), pick_count, self.random_order_mode.get())
-        else:
+        elif strategy == "watermark":
             if not self.source_has_selection("watermark_dir"):
                 messagebox.showerror("错误", "请先选择待处理视频")
                 return
@@ -2648,12 +2821,34 @@ class App:
                 "watermark_config": watermark_config,
             })
             self.total_tasks = len(watermark_videos)
+        else:
+            if not self.source_has_selection("replace_bgm_dir"):
+                messagebox.showerror("错误", "请先选择待处理视频")
+                return
+            replace_bgm_videos = self.get_source_videos("replace_bgm_dir")
+            if not replace_bgm_videos:
+                messagebox.showerror("错误", "未找到可用的视频文件")
+                return
+            try:
+                replace_bgm_config = self.get_replace_bgm_config()
+            except ValueError as error:
+                messagebox.showerror("错误", str(error))
+                return
+            config.update({
+                "replace_bgm_videos": replace_bgm_videos,
+                "replace_bgm_config": replace_bgm_config,
+            })
+            self.total_tasks = len(replace_bgm_videos)
 
         ffmpeg = find_binary("ffmpeg")
         ffprobe = find_binary("ffprobe")
         if not ffmpeg or not ffprobe:
             messagebox.showerror("错误", "未找到 FFmpeg/FFprobe，请将可执行文件放在程序目录或 ffmpeg 文件夹中")
             return
+        if strategy == "replace_bgm":
+            if not probe_has_audio(ffprobe, Path(config["replace_bgm_config"]["audio_path"])):
+                messagebox.showerror("错误", "所选 BGM 文件中未检测到可用音频流")
+                return
 
         self.stop_event.clear()
         self.completed_tasks = 0
@@ -2800,9 +2995,19 @@ class App:
                     self.update_progress()
                 else:
                     combinations.append((video_paths, output_name, output_path))
-        else:
+        elif strategy == "watermark":
             for input_video in config["watermark_videos"]:
                 output_name = f"{input_video.stem}_watermark.mp4"
+                output_path = output_dir / output_name
+                if skip_existing and output_path.exists():
+                    self.log(f"跳过已存在：{output_name}")
+                    self.completed_tasks += 1
+                    self.update_progress()
+                else:
+                    combinations.append(((input_video,), output_name, output_path))
+        else:
+            for input_video in config["replace_bgm_videos"]:
+                output_name = f"{input_video.stem}_replace_bgm{input_video.suffix.lower()}"
                 output_path = output_dir / output_name
                 if skip_existing and output_path.exists():
                     self.log(f"跳过已存在：{output_name}")
@@ -2904,6 +3109,44 @@ class App:
                     self.queue.put(("log_slot", slot_idx, f"失败: {logtxt}"))
                     return False, logtxt
 
+                if strategy == "replace_bgm":
+                    replace_bgm_config = config["replace_bgm_config"]
+                    input_video = video_list[0]
+                    duration = clip_durations[0]
+                    bgm_audio = Path(replace_bgm_config["audio_path"])
+                    bgm_duration = probe_duration(ffprobe, bgm_audio) or 0.0
+                    self.queue.put(("log_slot", slot_idx, "处理模式：完全替换原音频"))
+                    self.queue.put(("log_slot", slot_idx, "视频策略：视频流 copy，仅编码新的音频流"))
+                    if bgm_duration > 0:
+                        if duration > bgm_duration:
+                            self.queue.put(("log_slot", slot_idx, f"BGM 时长 {bgm_duration:.2f}s，小于视频时长 {duration:.2f}s，处理时将自动循环"))
+                        elif duration < bgm_duration:
+                            self.queue.put(("log_slot", slot_idx, f"BGM 时长 {bgm_duration:.2f}s，大于视频时长 {duration:.2f}s，处理时将自动截断"))
+
+                    def on_progress_task(remaining):
+                        minutes = int(remaining // 60)
+                        seconds = int(remaining % 60)
+                        self.queue.put(("title_slot", slot_idx, f"{output_name} (ETA: {minutes:02d}:{seconds:02d})"))
+                        self.queue.put(("eta", remaining))
+
+                    ok, logtxt = replace_video_bgm(
+                        ffmpeg,
+                        ffprobe,
+                        input_video,
+                        output_path,
+                        bgm_audio,
+                        progress_total=duration,
+                        on_progress=on_progress_task,
+                        on_proc=on_proc,
+                        stop_event=self.stop_event,
+                    )
+                    if ok:
+                        self.queue.put(("log_slot", slot_idx, "替换 BGM 成功"))
+                        return True, "replace_bgm"
+                    safe_remove(output_path)
+                    self.queue.put(("log_slot", slot_idx, f"失败: {logtxt}"))
+                    return False, logtxt
+
                 if resolution_mode == "custom":
                     target_resolution = custom_resolution
                 else:
@@ -2989,13 +3232,20 @@ class App:
                     try:
                         ok, mode_used = future.result()
                         if ok:
-                            note = "无损" if mode_used == "copy" else "兼容"
-                            self.log(f"{note}合并完成: {output_name}")
+                            if mode_used == "copy":
+                                note = "无损"
+                            elif mode_used == "watermark":
+                                note = "水印"
+                            elif mode_used == "replace_bgm":
+                                note = "替换BGM"
+                            else:
+                                note = "兼容"
+                            self.log(f"{note}处理完成: {output_name}")
                         else:
-                            self.log(f"合并失败: {output_name}")
+                            self.log(f"处理失败: {output_name}")
                             self.log(str(mode_used))
                     except Exception as e:
-                        self.log(f"合并异常: {output_name}")
+                        self.log(f"处理异常: {output_name}")
                         self.log(str(e))
                     finally:
                         with self.proc_lock:
@@ -3100,6 +3350,7 @@ class App:
             back_count = len(self.get_source_videos("back_dir"))
             random_count = len(self.get_source_videos("random_dir"))
             watermark_count = len(self.get_source_videos("watermark_dir"))
+            replace_bgm_count = len(self.get_source_videos("replace_bgm_dir"))
             pick_count = int(self.random_pick_count.get() or 2)
             random_order_mode = self.random_order_mode.get()
 
@@ -3111,8 +3362,10 @@ class App:
                 total = front_count * back_count if middle_count == 0 else front_count * middle_count * back_count
             elif self.tab_mode.get() == "random":
                 total = self.count_random_outputs(random_count, pick_count, random_order_mode)
-            else:
+            elif self.tab_mode.get() == "watermark":
                 total = watermark_count
+            else:
+                total = replace_bgm_count
             self.estimated_var.set(f"预计输出数量：{total}")
         except Exception:
             pass
