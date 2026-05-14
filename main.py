@@ -1256,6 +1256,7 @@ class App:
         self.replace_bgm_audio_path = StringVar()
         self.random_pick_count = IntVar(value=2)
         self.random_order_mode = StringVar(value=RANDOM_ORDER_DISTINCT)
+        self.structured_limit = StringVar(value="")
         self.transition_enabled = BooleanVar(value=False)
         self.transition_profile = StringVar(value="轻量")
         self.light_transition_seconds = StringVar(value=DEFAULT_LIGHT_TRANSITION_SECONDS)
@@ -1438,6 +1439,28 @@ class App:
         self.build_source_row(structured_tab, "middle_dir")
         self.build_source_row(structured_tab, "back_dir")
 
+        structured_limit_row = tk.Frame(structured_tab, bg=bg_color)
+        structured_limit_row.grid(row=3, column=0, sticky="ew", pady=4)
+        structured_limit_row.grid_columnconfigure(1, weight=1)
+        tk.Label(structured_limit_row, text="数量上限", font=font_normal, bg=bg_color, fg=fg_color, width=12, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Entry(
+            structured_limit_row,
+            textvariable=self.structured_limit,
+            font=font_normal,
+            bg="white",
+            fg=fg_color,
+            width=12,
+            highlightthickness=1,
+            highlightbackground="#d1d5db",
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        tk.Label(
+            structured_limit_row,
+            text="留空或 0 表示不限制，达到上限后停止生成后续拼接任务",
+            font=font_small,
+            bg=bg_color,
+            fg="#666666",
+        ).grid(row=1, column=1, sticky="w", padx=(10, 0))
+
         self.build_source_row(random_tab, "random_dir")
 
         random_pick_row = tk.Frame(random_tab, bg=bg_color)
@@ -1498,6 +1521,7 @@ class App:
             source["mode_var"].trace_add("write", lambda *args, field_name=field_name: self.handle_source_mode_change(field_name))
         self.random_pick_count.trace_add("write", lambda *args: self.update_counts())
         self.random_order_mode.trace_add("write", lambda *args: self.update_counts())
+        self.structured_limit.trace_add("write", lambda *args: self.handle_structured_limit_change())
         self.output_dir.trace_add("write", lambda *args: self.handle_directory_var_change("output_dir", self.output_dir))
         self.replace_bgm_audio_path.trace_add("write", lambda *args: self.handle_replace_bgm_audio_change())
         self.update_counts()
@@ -2197,6 +2221,11 @@ class App:
         self.refresh_source_widgets(field_name)
         self.update_counts()
 
+    def handle_structured_limit_change(self):
+        self.directory_memory["structured_limit"] = self.structured_limit.get().strip()
+        self.save_directory_memory()
+        self.update_counts()
+
     def pick_source_directory(self, field_name):
         source = self.source_fields[field_name]
         initial_dir = self.get_initial_source_browse_dir(field_name)
@@ -2655,6 +2684,9 @@ class App:
             remembered = self.directory_memory.get(field_name)
             if remembered and Path(remembered).is_dir():
                 target_var.set(remembered)
+        remembered_limit = self.directory_memory.get("structured_limit")
+        if remembered_limit is not None:
+            self.structured_limit.set(str(remembered_limit))
         remembered_audio = self.directory_memory.get("replace_bgm_audio_path")
         if remembered_audio and Path(remembered_audio).exists():
             self.replace_bgm_audio_path.set(remembered_audio)
@@ -2747,6 +2779,55 @@ class App:
             return math.comb(video_count, pick_count)
         return math.perm(video_count, pick_count)
 
+    def count_structured_outputs(self, front_count, middle_count, back_count):
+        if front_count <= 0 or back_count <= 0:
+            return 0
+        if middle_count <= 0:
+            return front_count * back_count
+        return front_count * middle_count * back_count
+
+    def parse_structured_limit(self):
+        raw_value = self.structured_limit.get().strip()
+        if not raw_value:
+            return None
+        try:
+            limit = int(raw_value)
+        except Exception as error:
+            raise ValueError("数量上限必须是正整数，留空或 0 表示不限制") from error
+        if limit < 0:
+            raise ValueError("数量上限不能小于 0")
+        if limit == 0:
+            return None
+        return limit
+
+    def iter_structured_video_paths(self, fronts, middles, backs):
+        if not fronts or not backs:
+            return
+
+        active_fronts = []
+        if middles:
+            for front in fronts:
+                active_fronts.append((front, itertools.product(middles, backs)))
+        else:
+            for front in fronts:
+                active_fronts.append((front, iter(backs)))
+
+        active_queue = queue.deque(active_fronts)
+        while active_queue:
+            front, iterator = active_queue.popleft()
+            try:
+                next_value = next(iterator)
+            except StopIteration:
+                continue
+
+            if middles:
+                middle, back = next_value
+                yield (front, middle, back)
+            else:
+                back = next_value
+                yield (front, back)
+            active_queue.append((front, iterator))
+
     def build_output_name(self, video_paths):
         return "_".join(video_path.stem for video_path in video_paths) + "_merged.mp4"
 
@@ -2782,12 +2863,19 @@ class App:
             if not fronts or not backs:
                 messagebox.showerror("错误", "未找到可用的视频文件")
                 return
+            try:
+                structured_limit = self.parse_structured_limit()
+            except ValueError as error:
+                messagebox.showerror("错误", str(error))
+                return
+            theoretical_total = self.count_structured_outputs(len(fronts), len(middles), len(backs))
             config.update({
                 "fronts": fronts,
                 "middles": middles,
                 "backs": backs,
+                "structured_limit": structured_limit,
             })
-            self.total_tasks = len(fronts) * len(backs) if not middles else len(fronts) * len(middles) * len(backs)
+            self.total_tasks = min(theoretical_total, structured_limit) if structured_limit is not None else theoretical_total
         elif strategy == "random":
             if not self.source_has_selection("random_dir"):
                 messagebox.showerror("错误", "请先选择候选素材")
@@ -2933,6 +3021,7 @@ class App:
         ffmpeg = config["ffmpeg"]
         ffprobe = config["ffprobe"]
         max_workers = config.get("max_workers", 1)
+        structured_limit = config.get("structured_limit")
 
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -2956,31 +3045,18 @@ class App:
             fronts = config["fronts"]
             middles = config.get("middles", [])
             backs = config["backs"]
-            if middles:
-                for front in fronts:
-                    for middle in middles:
-                        for back in backs:
-                            video_paths = (front, middle, back)
-                            output_name = self.build_output_name(video_paths)
-                            output_path = output_dir / output_name
-                            if skip_existing and output_path.exists():
-                                self.log(f"跳过已存在：{output_name}")
-                                self.completed_tasks += 1
-                                self.update_progress()
-                            else:
-                                combinations.append((video_paths, output_name, output_path))
-            else:
-                for front in fronts:
-                    for back in backs:
-                        video_paths = (front, back)
-                        output_name = self.build_output_name(video_paths)
-                        output_path = output_dir / output_name
-                        if skip_existing and output_path.exists():
-                            self.log(f"跳过已存在：{output_name}")
-                            self.completed_tasks += 1
-                            self.update_progress()
-                        else:
-                            combinations.append((video_paths, output_name, output_path))
+            for video_paths in self.iter_structured_video_paths(fronts, middles, backs):
+                output_name = self.build_output_name(video_paths)
+                output_path = output_dir / output_name
+                if skip_existing and output_path.exists():
+                    self.log(f"跳过已存在：{output_name}")
+                    if structured_limit is None:
+                        self.completed_tasks += 1
+                        self.update_progress()
+                    continue
+                combinations.append((video_paths, output_name, output_path))
+                if structured_limit is not None and len(combinations) >= structured_limit:
+                    break
         elif strategy == "random":
             random_videos = config["random_videos"]
             pick_count = config["pick_count"]
@@ -3015,6 +3091,10 @@ class App:
                     self.update_progress()
                 else:
                     combinations.append(((input_video,), output_name, output_path))
+
+        if strategy == "structured" and structured_limit is not None:
+            self.total_tasks = len(combinations)
+            self.update_progress()
 
         if not combinations:
             self.finish()
@@ -3365,20 +3445,28 @@ class App:
             replace_bgm_count = len(self.get_source_videos("replace_bgm_dir"))
             pick_count = int(self.random_pick_count.get() or 2)
             random_order_mode = self.random_order_mode.get()
+            structured_limit = self.parse_structured_limit()
 
             for field_name in self.source_fields:
                 self.refresh_source_widgets(field_name)
             self.random_pick_info_var.set(f"当前拼接数量：{pick_count} 段")
 
             if self.tab_mode.get() == "structured":
-                total = front_count * back_count if middle_count == 0 else front_count * middle_count * back_count
+                theoretical_total = self.count_structured_outputs(front_count, middle_count, back_count)
+                total = min(theoretical_total, structured_limit) if structured_limit is not None else theoretical_total
             elif self.tab_mode.get() == "random":
+                theoretical_total = self.count_random_outputs(random_count, pick_count, random_order_mode)
                 total = self.count_random_outputs(random_count, pick_count, random_order_mode)
             elif self.tab_mode.get() == "watermark":
+                theoretical_total = watermark_count
                 total = watermark_count
             else:
+                theoretical_total = replace_bgm_count
                 total = replace_bgm_count
-            self.estimated_var.set(f"预计输出数量：{total}")
+            if total != theoretical_total:
+                self.estimated_var.set(f"预计输出数量：{total}（理论总数：{theoretical_total}）")
+            else:
+                self.estimated_var.set(f"预计输出数量：{total}")
         except Exception:
             pass
 
