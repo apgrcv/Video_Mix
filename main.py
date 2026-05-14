@@ -988,7 +988,7 @@ def build_watermark_image_filter(scale_percent, opacity_percent, x_pos, y_pos, e
     overlay_filter = ":".join(overlay_args)
     return (
         f"[1:v]format=rgba,colorchannelmixer=aa={opacity_ratio:.3f}[wmraw];"
-        f"[wmraw][0:v]scale2ref=w=main_w*{scale_ratio:.4f}:h=ow/mdar[wm][base];"
+        f"[wmraw][0:v]scale2ref=w=iw*{scale_ratio:.4f}:h=ow/mdar[wm][base];"
         f"[base][wm]overlay={overlay_filter}[v]"
     )
 
@@ -3058,6 +3058,18 @@ class App:
                         self.queue.put(("log_slot", slot_idx, "编码策略：极速模式"))
                     if intervals:
                         self.queue.put(("log_slot", slot_idx, f"命中时间段数：{len(intervals)}"))
+                    if watermark_config["mode"] == WATERMARK_MODE_IMAGE:
+                        self.queue.put((
+                            "log_slot",
+                            slot_idx,
+                            f"图片参数：大小={watermark_config['scale_percent']}% 透明度={watermark_config['opacity_percent']}% X={watermark_config['x_pos']} Y={watermark_config['y_pos']}",
+                        ))
+                    else:
+                        self.queue.put((
+                            "log_slot",
+                            slot_idx,
+                            f"文字参数：字号={watermark_config['font_size']} 透明度={watermark_config['opacity_percent']}% X={watermark_config['x_pos']} Y={watermark_config['y_pos']}",
+                        ))
 
                     def on_progress_task(remaining):
                         minutes = int(remaining // 60)
