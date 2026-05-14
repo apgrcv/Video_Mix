@@ -3,6 +3,7 @@ import itertools
 import math
 import os
 import queue
+import shlex
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,7 @@ APP_VERSION = "2026-03-10-fast-transition"
 RANDOM_ORDER_DISTINCT = "顺序不同算不同结果"
 RANDOM_ORDER_IGNORE = "顺序不同算同一结果"
 SETTINGS_FILE = ".video_mix_settings.json"
+DROP_PICKER_FILE = "drop_picker.py"
 
 TRANSITION_PROFILES = {
     "极速": {"fade_duration": 0.08, "gap_duration": 0.0},
@@ -1295,6 +1297,7 @@ class App:
         self.log_panels = []
         self.thread_slots = None
         self.settings_path = Path(__file__).resolve().parent / SETTINGS_FILE
+        self.drop_picker_path = Path(__file__).resolve().parent / DROP_PICKER_FILE
         self.directory_memory = self.load_directory_memory()
         self.watermark_interval_rows = []
         self.watermark_preview_photo = None
@@ -1693,6 +1696,7 @@ class App:
         tk.Label(image_frame, text="PNG 水印", font=font_normal, bg=bg_color, fg=fg_color, width=10, anchor="w").grid(row=0, column=0, sticky="w")
         tk.Entry(image_frame, textvariable=self.watermark_image_path, font=font_normal, bg="white", fg=fg_color, highlightthickness=1, highlightbackground="#d1d5db").grid(row=0, column=1, sticky="ew", padx=(10, 10))
         tk.Button(image_frame, text="选择图片", command=self.pick_watermark_image, font=self.font_normal, highlightbackground=bg_color).grid(row=0, column=2, sticky="e")
+        tk.Button(image_frame, text="拖入图片", command=self.open_watermark_image_drop, font=self.font_normal, highlightbackground=bg_color).grid(row=0, column=3, sticky="e", padx=(8, 0))
         self.watermark_image_meta_var = StringVar(value="图片尺寸：未选择")
         tk.Label(image_frame, textvariable=self.watermark_image_meta_var, font=font_small, bg=bg_color, fg="#666666").grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(4, 0))
 
@@ -1820,6 +1824,13 @@ class App:
             font=self.font_normal,
             highlightbackground=bg_color,
         ).grid(row=0, column=2, sticky="e")
+        tk.Button(
+            bgm_audio_row,
+            text="拖入音频",
+            command=self.open_replace_bgm_audio_drop,
+            font=self.font_normal,
+            highlightbackground=bg_color,
+        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
 
         bgm_hint_row = tk.Frame(replace_bgm_options_frame, bg=bg_color)
         bgm_hint_row.grid(row=1, column=0, sticky="ew", pady=(2, 4))
@@ -2028,6 +2039,15 @@ class App:
         )
         select_dir_button.grid(row=0, column=1, sticky="e")
 
+        drop_dir_button = tk.Button(
+            action_row,
+            text="拖入目录",
+            command=lambda field_name=field_name: self.open_source_directory_drop(field_name),
+            font=self.font_normal,
+            highlightbackground=self.ui_bg,
+        )
+        drop_dir_button.grid(row=0, column=2, sticky="e", padx=(8, 0))
+
         select_files_button = tk.Button(
             action_row,
             text="选择文件",
@@ -2035,7 +2055,16 @@ class App:
             font=self.font_normal,
             highlightbackground=self.ui_bg,
         )
-        select_files_button.grid(row=0, column=2, sticky="e", padx=(8, 0))
+        select_files_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+        drop_files_button = tk.Button(
+            action_row,
+            text="拖入文件",
+            command=lambda field_name=field_name: self.open_source_files_drop(field_name),
+            font=self.font_normal,
+            highlightbackground=self.ui_bg,
+        )
+        drop_files_button.grid(row=0, column=4, sticky="e", padx=(8, 0))
 
         view_files_button = tk.Button(
             action_row,
@@ -2044,7 +2073,7 @@ class App:
             font=self.font_normal,
             highlightbackground=self.ui_bg,
         )
-        view_files_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
+        view_files_button.grid(row=0, column=5, sticky="e", padx=(8, 0))
 
         clear_files_button = tk.Button(
             action_row,
@@ -2053,13 +2082,15 @@ class App:
             font=self.font_normal,
             highlightbackground=self.ui_bg,
         )
-        clear_files_button.grid(row=0, column=4, sticky="e", padx=(8, 0))
+        clear_files_button.grid(row=0, column=6, sticky="e", padx=(8, 0))
 
         source["count_var"] = StringVar(value="未选择目录")
         tk.Label(row_frame, textvariable=source["count_var"], font=self.font_small, bg=self.ui_bg, fg="#666666").grid(row=2, column=0, sticky="w", pady=(6, 0))
 
         source["select_dir_button"] = select_dir_button
+        source["drop_dir_button"] = drop_dir_button
         source["select_files_button"] = select_files_button
+        source["drop_files_button"] = drop_files_button
         source["view_files_button"] = view_files_button
         source["clear_files_button"] = clear_files_button
         source["display_entry"] = display_entry
@@ -2076,6 +2107,13 @@ class App:
         entry = tk.Entry(row_frame, textvariable=var, font=self.font_normal, bg="white", fg=self.ui_fg, highlightthickness=1, highlightbackground="#d1d5db")
         entry.grid(row=0, column=1, sticky="ew", padx=(10, 10))
         tk.Button(row_frame, text=button_text, command=command, font=self.font_normal, highlightbackground=self.ui_bg).grid(row=0, column=2, sticky="e")
+        tk.Button(
+            row_frame,
+            text="拖入目录",
+            command=lambda var=var: self.open_directory_drop("拖入输出目录", lambda path: self.apply_directory_value("output_dir", var, path, update_counts=True)),
+            font=self.font_normal,
+            highlightbackground=self.ui_bg,
+        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
         return row_frame
 
     def get_source_files_key(self, field_name):
@@ -2198,16 +2236,110 @@ class App:
         has_selected_files = len(self.get_source_file_paths(field_name)) > 0
         if is_files_mode:
             source["select_dir_button"].grid_remove()
+            source["drop_dir_button"].grid_remove()
             source["select_files_button"].grid()
+            source["drop_files_button"].grid()
             source["view_files_button"].grid()
             source["clear_files_button"].grid()
             source["view_files_button"].configure(state="normal" if has_selected_files else "disabled")
             source["clear_files_button"].configure(state="normal" if has_selected_files else "disabled")
         else:
             source["select_dir_button"].grid()
+            source["drop_dir_button"].grid()
             source["select_files_button"].grid_remove()
+            source["drop_files_button"].grid_remove()
             source["view_files_button"].grid_remove()
             source["clear_files_button"].grid_remove()
+
+    def get_drop_picker_python(self):
+        if shutil.which("python3"):
+            return "python3"
+        if shutil.which("python"):
+            return "python"
+        return None
+
+    def open_drop_picker(self, mode, title, multiple=False):
+        if not self.drop_picker_path.exists():
+            messagebox.showerror("提示", f"未找到拖拽窗口脚本：{self.drop_picker_path.name}")
+            return None
+        python_cmd = self.get_drop_picker_python()
+        if not python_cmd:
+            messagebox.showerror("提示", "未找到可用的 Python 运行环境，无法打开拖拽窗口。")
+            return None
+        cmd = [python_cmd, str(self.drop_picker_path), "--mode", mode, "--title", title]
+        if multiple:
+            cmd.append("--multiple")
+        try:
+            completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", check=False)
+        except Exception as exc:
+            messagebox.showerror("提示", f"启动拖拽窗口失败：{exc}")
+            return None
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "未知错误"
+            if "No module named 'PySide6'" in detail:
+                detail = "当前环境未安装 PySide6，无法打开拖拽窗口。"
+            messagebox.showerror("提示", detail)
+            return None
+        output = completed.stdout.strip()
+        if not output:
+            return None
+        try:
+            return json.loads(output.splitlines()[-1])
+        except json.JSONDecodeError:
+            messagebox.showerror("提示", f"拖拽窗口返回数据无法解析：{output}")
+            return None
+
+    def apply_directory_value(self, field_name, target_var, path, update_counts=False):
+        target_var.set(path)
+        self.remember_directory(field_name, path)
+        if update_counts:
+            self.update_counts()
+
+    def open_directory_drop(self, title, on_success):
+        payload = self.open_drop_picker("directory", title)
+        if not payload or not payload.get("ok"):
+            return
+        on_success(payload["path"])
+
+    def open_source_directory_drop(self, field_name):
+        self.open_directory_drop(
+            f"拖入{self.source_fields[field_name]['label']}目录",
+            lambda path, field_name=field_name: self.apply_source_directory_drop(field_name, path),
+        )
+
+    def apply_source_directory_drop(self, field_name, path):
+        source = self.source_fields[field_name]
+        source["dir_var"].set(path)
+        self.remember_directory(field_name, path)
+        self.refresh_source_widgets(field_name)
+        self.update_counts()
+
+    def open_source_files_drop(self, field_name):
+        payload = self.open_drop_picker("video_files", f"拖入{self.source_fields[field_name]['label']}文件", multiple=True)
+        if not payload or not payload.get("ok"):
+            return
+        self.set_source_file_paths(field_name, payload["paths"])
+        self.refresh_source_widgets(field_name)
+        self.update_counts()
+
+    def open_watermark_image_drop(self):
+        payload = self.open_drop_picker("png_file", "拖入 PNG 水印文件")
+        if not payload or not payload.get("ok"):
+            return
+        self.watermark_image_path.set(payload["path"])
+        self.directory_memory["last_browsed_dir"] = str(Path(payload["path"]).parent)
+        self.save_directory_memory()
+        try:
+            image = tk.PhotoImage(file=payload["path"])
+            self.watermark_image_meta_var.set(f"图片尺寸：{image.width()} × {image.height()}")
+        except Exception:
+            self.watermark_image_meta_var.set("图片尺寸：读取失败")
+
+    def open_replace_bgm_audio_drop(self):
+        payload = self.open_drop_picker("audio_file", "拖入 BGM 音频文件")
+        if not payload or not payload.get("ok"):
+            return
+        self.replace_bgm_audio_path.set(payload["path"])
 
     def handle_source_dir_change(self, field_name):
         source = self.source_fields[field_name]
